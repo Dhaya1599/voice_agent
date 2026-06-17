@@ -38,8 +38,8 @@ NUMBER_FORMAT_RULE = """
 CRITICAL FORMATTING RULE: Whenever you mention any number sequence such as 
 an order ID, phone number, or reference number, ALWAYS space out each digit 
 individually. For example:
-- Order ID 1001 → say "1 0 0 1"
-- Phone 9876543210 → say "9 8 7 6 5 4 3 2 1 0"
+- Order ID 1001 -> say "1 0 0 1"
+- Phone 9876543210 -> say "9 8 7 6 5 4 3 2 1 0"
 
 NEVER space out the following — say them naturally:
 - Prices ($49.99, $150)
@@ -83,6 +83,7 @@ WHAT TO NEVER DO:
 - Never ignore an emotional statement to jump straight to facts
 - Never use corporate jargon like "per our policy", "as per records", "kindly note"
 """
+
 PRODUCT_QUERY_RULES = """
 HANDLING PRODUCT-SPECIFIC QUERIES — VERY IMPORTANT:
 
@@ -105,30 +106,19 @@ STEP 2 — Once they specify a product or category, answer ONLY for that product
 STEP 3 — If the customer already mentioned a specific product, answer directly without asking again.
 
 EXAMPLES:
-✅ Customer: "Do you have any offers?"
-   Agent: "Absolutely! Could you tell me which product or category you're interested in?"
+- Customer: "Do you have any offers?"
+  Agent: "Absolutely! Could you tell me which product or category you're interested in?"
 
-✅ Customer: "What is the return policy for the MacBook Air?"
-   Agent: [answer directly — product already specified]
+- Customer: "What is the return policy for the MacBook Air?"
+  Agent: [answer directly — product already specified]
 
-✅ Customer: "What are your laptop offers?"
-   Agent: [answer directly — category already specified]
+- Customer: "What are your laptop offers?"
+  Agent: [answer directly — category already specified]
 
-❌ NEVER list all products or all offers unprompted.
+* NEVER list all products or all offers unprompted.
 
 {product_categories}
 """
-
-SYSTEM_PROMPT_UNVERIFIED = """You are Maya, a warm and professional customer support agent.\n"
-    "This is a voice phone call — keep all responses under 2 sentences.\n"
-    + PERSONALITY_RULES
-    + NUMBER_FORMAT_RULE
-    + dynamic_product_rules
-    + "\nYou do not have the customer's order details yet.\n"
-    "Greet the customer warmly and ask for their Order ID to proceed.\n"
-    "Do not reveal or guess any order information until the Order ID is provided.\n"
-    "If the customer seems frustrated before even giving their order ID, acknowledge it first."""
-
 
 SYSTEM_PROMPT_VERIFIED = """You are Maya, a warm and professional customer support agent.
 This is a voice phone call — keep all responses under 2 sentences.
@@ -138,11 +128,11 @@ This is a voice phone call — keep all responses under 2 sentences.
 TODAY'S DATE: {today_date}
 
 Use today's date to answer relative time questions accurately:
-- If customer asks "will it arrive tomorrow?" → compare expected delivery date with tomorrow's date
-- If customer asks "will it arrive in 2 days?" → calculate from today
-- If expected delivery date has already passed and order not delivered → acknowledge the delay empathetically
+- If customer asks "will it arrive tomorrow?" -> compare expected delivery date with tomorrow's date
+- If customer asks "will it arrive in 2 days?" -> calculate from today
+- If expected delivery date has already passed and order not delivered -> acknowledge the delay empathetically
 - Always say the delivery date naturally like "this Friday" or "in 2 days" when possible
-- If today is the expected delivery date → tell the customer it should arrive today
+- If today is the expected delivery date -> tell the customer it should arrive today
 
 The ORDER ID is the number under 'ORDER ID:' in the data below.
 Never refer to the phone number as an order ID.
@@ -173,9 +163,8 @@ def build_additional_context(user_message):
     """
     Check if the customer's message needs extra context beyond order data.
     Pulls offers, return policy, warranty, or store info as needed.
-    Returns additional context string or empty string.
     """
-    from database import (
+    from db.database import (
         get_product_offers, get_return_policy,
         get_warranty, get_store_info
     )
@@ -183,25 +172,21 @@ def build_additional_context(user_message):
     additional_context = ""
     msg_lower = user_message.lower()
 
-    # Offers and promotions
     if any(w in msg_lower for w in ["offer", "discount", "deal", "promotion", "sale"]):
         offers = get_product_offers()
         if offers:
             additional_context += f"\n\n{offers}"
 
-    # Return and refund policy
     if any(w in msg_lower for w in ["return", "refund", "send back", "exchange"]):
         return_policy = get_return_policy()
         if return_policy:
             additional_context += f"\n\n{return_policy}"
 
-    # Warranty information
     if any(w in msg_lower for w in ["warranty", "guarantee", "repair", "damage"]):
         warranty = get_warranty()
         if warranty:
             additional_context += f"\n\n{warranty}"
 
-    # Store information
     if any(w in msg_lower for w in ["store", "shop", "location", "branch", "timing", "open", "close"]):
         city = None
         known_cities = ["chennai", "mumbai", "bangalore", "delhi", "kolkata", "hyderabad"]
@@ -216,129 +201,143 @@ def build_additional_context(user_message):
     return additional_context
 
 
+def sanitize_history(raw_history):
+    """
+    Clean conversation history:
+    - Remove system messages
+    - Remove duplicate messages
+    - Remove assistant echoes (assistant replies that exactly match a user message)
+    """
+    # Collect all user message texts for echo detection
+    user_texts = {
+        m["content"].strip().lower()
+        for m in raw_history
+        if m["role"] == "user"
+    }
+
+    seen = set()
+    cleaned = []
+
+    for msg in raw_history:
+        # Drop system messages — we inject our own
+        if msg["role"] == "system":
+            continue
+
+        # Drop assistant echoes — assistant content that mirrors a user message
+        if msg["role"] == "assistant":
+            if msg["content"].strip().lower() in user_texts:
+                continue
+
+        # Deduplicate exact (role, content) pairs
+        key = (msg["role"], msg["content"].strip())
+        if key in seen:
+            continue
+
+        seen.add(key)
+        cleaned.append(msg)
+
+    return cleaned
+
+
 def chat(user_message, call_sid=None):
-    from database import (
+    from db.database import (
         get_conversation_history, save_message,
         get_order_context, get_order_context_cached,
-        get_verified_order, save_verified_order
+        get_verified_order, save_verified_order,
+        get_product_categories
     )
 
     # ── Step 1: Save user message immediately ──
     if call_sid:
         save_message(call_sid, "user", user_message)
 
-    # ── Step 2: Get conversation history ──
-    conversation_history = get_conversation_history(call_sid) if call_sid else []
-    conversation_history = [m for m in conversation_history if m["role"] != "system"]
+    # ── Step 2: Get and sanitize conversation history ──
+    raw_history = get_conversation_history(call_sid) if call_sid else []
+    cleaned_history = sanitize_history(raw_history)
 
     # ── Step 3: Detect sentiment ──
     sentiment = detect_sentiment(user_message)
+    sentiment_instruction = ""
     if sentiment != "NEUTRAL":
         sentiment_instruction = (
             f"\nIMPORTANT: The customer appears to be {sentiment}. "
             f"Acknowledge their emotion with empathy in your very first sentence before answering.\n"
         )
-    else:
-        sentiment_instruction = ""
 
-    from database import get_product_categories
-
-    # Fetch live categories from database
     product_categories = get_product_categories()
+    dynamic_product_rules = PRODUCT_QUERY_RULES.format(product_categories=product_categories)
 
-    # Inject into PRODUCT_QUERY_RULES
-    dynamic_product_rules = PRODUCT_QUERY_RULES.format(
-        product_categories=product_categories
-    )
-
-    # ── Step 4: Build system prompt ──
-    system_prompt = None
-
+    # ── Step 4: Build system prompt dynamically ──
     verified_order_id = get_verified_order(call_sid) if call_sid else None
 
     if verified_order_id:
-        # Order already verified — load full context
         order_context = get_order_context_cached(int(verified_order_id), call_sid)
         today_str = get_today_string()
-
-        # Check if additional context is needed
         additional_context = build_additional_context(user_message)
 
         system_prompt = SYSTEM_PROMPT_VERIFIED.format(
             today_date=today_str,
-            order_context=order_context + additional_context
+            order_context=str(order_context) + str(additional_context)
         ) + sentiment_instruction
-
-        print(f"[{call_sid}] Order: {verified_order_id} | Sentiment: {sentiment} | Today: {today_str}")
-
+        print(f"[{call_sid}] Order: {verified_order_id} | Sentiment: {sentiment}")
     else:
-        # Try to extract order ID from current message
         order_id = extract_order_id(user_message)
-
         if order_id:
             order_context = get_order_context(int(order_id))
-
             if order_context:
-                # Valid order found — save and build verified prompt
                 save_verified_order(call_sid, str(order_id))
-                today_str = get_today_string()
-
                 system_prompt = (
-                    "You are Maya, a warm and professional customer support agent. "
-                    "Keep all responses under 2 sentences — this is a voice call.\n\n"
-                    + PERSONALITY_RULES + "\n"
-                    + NUMBER_FORMAT_RULE + "\n\n"
-                    "The customer just provided their Order ID and it was found. "
-                    "Greet them warmly by their first name from the data below and ask how you can help.\n\n"
-                    + order_context
+                    "You are Maya, a warm and professional customer support agent. Keep all responses under 2 sentences.\n\n"
+                    + PERSONALITY_RULES + "\n" + NUMBER_FORMAT_RULE + "\n\n"
+                    + "The customer just provided their Order ID and it was found. Greet them warmly by their first name from the data below and ask how you can help.\n\n"
+                    + str(order_context)
                 )
-                print(f"[{call_sid}] Order {order_id} found and loaded.")
-
             else:
-                # Order ID given but not found
-                system_prompt = (
-                    "You are Maya, a warm and professional customer support agent. "
-                    "Keep all responses under 2 sentences — this is a voice call.\n\n"
-                    "The customer provided an Order ID but it was not found in the system. "
-                    "Apologise warmly and ask them to double check their order confirmation and try again."
-                )
-                print(f"[{call_sid}] Order ID {order_id} not found in database.")
-
+                system_prompt = "You are Maya, a warm and professional customer support agent. The order ID was not found. Apologise and ask them to retry."
         else:
-            # No order ID yet
-            system_prompt = SYSTEM_PROMPT_UNVERIFIED
-            if sentiment != "NEUTRAL":
-                system_prompt += (
-                    f"\nIMPORTANT: Customer appears {sentiment} — "
-                    f"acknowledge their emotion first.\n"
-                )
-            print(f"[{call_sid}] No order ID yet | Sentiment: {sentiment}")
+            system_prompt = (
+                "You are Maya, a warm and professional customer support agent. Keep all responses under 2 sentences.\n\n"
+                + PERSONALITY_RULES + "\n" + NUMBER_FORMAT_RULE + "\n" + dynamic_product_rules + "\n"
+                + "\nAsk the customer for their Order ID to proceed."
+            )
 
-    # ── Step 5: Build full message list and call LLM ──
-    conversation_history.insert(0, {"role": "system", "content": system_prompt})
-    conversation_history.append({"role": "user", "content": user_message})
+    # ── Step 5: Build final payload ──
+    # cleaned_history already contains the current user message (saved in Step 1)
+    # so we just extend directly — no need to re-append
+    final_messages = [{"role": "system", "content": system_prompt}]
+    final_messages.extend(cleaned_history)
 
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=conversation_history,
-        max_tokens=100,
-        temperature=0.3
-    )
+    # Safety check: payload must end with a user message
+    if not final_messages or final_messages[-1]["role"] != "user":
+        final_messages.append({"role": "user", "content": user_message})
+    print(f"[{call_sid}] verified_order_id = {verified_order_id}")
+    print(f"[{call_sid}] final_messages count = {len(final_messages)}")
+    print(f"[{call_sid}] last message = {final_messages[-1]}")
+    print(f"[{call_sid}] system prompt start = {system_prompt[:100]}")
+    # ── Step 6: Call Groq API ──
+    
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=final_messages,
+            max_tokens=100,
+            temperature=0.4
+        )
+        reply = response.choices[0].message.content.strip()
+        print(f"[{call_sid}] RAW LLM REPLY: '{reply}'")
+    except Exception as e:
+        print(f"[{call_sid}] GROQ CRASH: {e}")
+        import traceback
+        traceback.print_exc()
+        reply = ""
+    # ── Step 7: Echo guard — catch any LLM slip-through echoes ──
+    if not reply or reply.lower() == user_message.strip().lower():
+        reply = "Let me look into that for you right now — could you give me just a moment?"
 
-    reply = response.choices[0].message.content
-
-    # ── Step 6: Save reply ──
+    # ── Step 8: Save reply ──
     if call_sid:
         save_message(call_sid, "assistant", reply)
 
     return reply
-
-
-if __name__ == "__main__":
-    print("Customer Support Agent Ready. Type 'quit' to exit.\n")
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() == "quit":
-            break
-        response = chat(user_input)
-        print(f"Agent: {response}\n")
+    
+  
