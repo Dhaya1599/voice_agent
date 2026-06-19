@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Command Center Pro // Light</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        slate: { 50: '#F8FAFC', 100: '#F1F5F9', 200: '#E2E8F0', 300: '#CBD5E1', 700: '#334155', 800: '#1E293B', 900: '#0F172A' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        /* Smooth micro-interaction transitions */
+        .interactive-card {
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .interactive-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 20px -8px rgba(99, 102, 241, 0.15);
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans min-h-screen selection:bg-indigo-100">
+
+    <nav class="bg-white border-b border-slate-200 px-6 md:px-8 py-4 flex justify-between items-center shadow-sm sticky top-0 z-50 backdrop-blur-md bg-white/95">
+        <div class="flex items-center space-x-3">
+            <div class="relative flex h-2.5 w-2.5">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-green-500"></span>
+            </div>
+            <h1 class="text-lg font-black tracking-wider text-slate-900 font-mono">MAYA.AI <span class="text-indigo-600 text-xs font-bold font-sans tracking-normal ml-1">// Live Voice Desk</span></h1>
+        </div>
+        <div class="flex items-center space-x-4">
+            <span class="text-xs font-semibold text-indigo-700 font-mono bg-indigo-50 border border-indigo-100 px-3 py-1.5 rounded-lg shadow-sm">Role: Super_Admin</span>
+            <div class="h-6 w-px bg-slate-200 hidden sm:block"></div>
+            <p id="time-display" class="text-xs font-mono text-slate-500 hidden sm:block font-medium"></p>
+        </div>
+    </nav>
+
+    <main class="max-w-[1600px] mx-auto p-4 md:p-8 space-y-8">
+        
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+            <div>
+                <h2 class="text-2xl font-extrabold text-slate-900 tracking-tight">System Performance Metrics</h2>
+                <p class="text-slate-500 text-sm mt-0.5 font-medium">Real-time telemetry overview of automated audio loops, financial burn rates, and intent logs.</p>
+            </div>
+            <button onclick="fetchLogs()" class="w-full sm:w-auto flex items-center justify-center space-x-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-5 py-2.5 rounded-xl shadow-md shadow-indigo-600/10 transition-all active:scale-95 group">
+                <span class="group-hover:rotate-180 transition-transform duration-500 text-sm">🔄</span> <span class="tracking-wide text-sm">Sync Analytics</span>
+            </button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div class="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative overflow-hidden group interactive-card hover:border-slate-300">
+                <div class="absolute top-0 right-0 p-4 opacity-[0.04] text-3xl font-mono font-black text-slate-900">$$</div>
+                <span class="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-1">Total Operations Cost</span>
+                <span id="total-cost" class="text-2xl font-black text-emerald-600 tracking-tight font-sans">$0.00</span>
+                <p class="text-[10px] font-medium text-slate-400 mt-2 font-mono">Aggregated processing tokens</p>
+            </div>
+
+            <div class="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative overflow-hidden group interactive-card hover:border-slate-300">
+                <div class="absolute top-0 right-0 p-4 opacity-[0.04] text-3xl text-slate-900">📊</div>
+                <span class="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-1">Average Cost / Session</span>
+                <span id="avg-cost" class="text-2xl font-black text-indigo-600 tracking-tight font-sans">$0.00</span>
+                <p class="text-[10px] font-medium text-slate-400 mt-2 font-mono">Mean pipeline execution expense</p>
+            </div>
+
+            <div class="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative overflow-hidden group interactive-card hover:border-slate-300">
+                <div class="absolute top-0 right-0 p-4 opacity-[0.04] text-3xl text-slate-900">⚠️</div>
+                <span class="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-1">Human Transfers</span>
+                <span id="human-transfers" class="text-2xl font-black text-amber-600 tracking-tight font-sans">0</span>
+                <p class="text-[10px] font-semibold text-amber-700 font-mono mt-2" id="transfer-pct">0% escalated load</p>
+            </div>
+
+            <div class="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative overflow-hidden group interactive-card hover:border-slate-300">
+                <div class="absolute top-0 right-0 p-4 opacity-[0.04] text-3xl text-slate-900">⭐</div>
+                <span class="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-1">User Call service Reviews (CSAT)</span>
+                <span id="csat-score" class="text-2xl font-black text-cyan-600 tracking-tight font-sans">0.0 <span class="text-xs font-bold text-slate-400 font-mono">/ 5.0</span></span>
+                <div class="w-full bg-slate-100 h-1 rounded-full mt-3 overflow-hidden border border-slate-200/50">
+                    <div id="csat-bar" class="bg-cyan-500 h-full transition-all duration-500 rounded-full" style="width: 0%"></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div class="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+                <div class="flex justify-between items-center mb-6">
+                    <div>
+                        <h3 class="font-extrabold text-base text-slate-900 uppercase tracking-wider">Voice Traffic Scaling</h3>
+                        <p class="text-xs font-medium text-slate-400 mt-0.5">Chronological index tracking concurrent user load over active pipelines.</p>
+                    </div>
+                    <span class="text-xs font-mono font-bold bg-slate-100 text-slate-600 px-3 py-1 rounded-full border border-slate-200 shadow-sm">Real-Time</span>
+                </div>
+                <div class="h-[280px] w-full relative">
+                    <canvas id="trafficChart"></canvas>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col justify-between">
+                <div>
+                    <h3 class="font-extrabold text-base text-slate-900 uppercase tracking-wider mb-0.5">Intent Taxonomy Distribution</h3>
+                    <p class="text-xs font-medium text-slate-400 mb-6">Categorized breakdown of voice transcripts mapped dynamically.</p>
+                    <div id="intent-progress-container" class="space-y-4">
+                        <div class="text-xs font-mono font-medium text-slate-400 text-center py-12">Handshaking background logging targets...</div>
+                    </div>
+                </div>
+                <div >
+                    <span>Active System Records:</span>
+                    <span id="total-calls-badge" class="bg-slate-900 text-white px-2.5 py-0.5 rounded-md font-bold shadow-sm">0 Sessions</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div class="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden flex flex-col justify-between">
+                <div>
+                    <div class="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex justify-between items-center">
+                        <h3 class="font-extrabold text-slate-900 text-sm uppercase tracking-wider flex items-center gap-2">
+                            <span>📄</span> Active Session Ledger
+                        </h3>
+                        <span class="text-xs font-mono font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 px-3 py-1 rounded-full shadow-sm">SQL*Plus Connected</span>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse">
+                            <thead>
+                                <tr>
+                                    <th class="p-4 pl-6">Session ID Identifier</th>
+                                    <th class="p-4">Customer Reference</th>
+                                    <th class="p-4">Detected Intent</th>
+                                    <th class="p-4">Routing Channel</th>
+                                    <th class="p-4 text-right pr-6">Telemetry Cost</th>
+                                </tr>
+                            </thead>
+                            <tbody id="logs-table-body" class="divide-y divide-slate-100">
+                                <tr>
+                                    <td colspan="5" class="p-12 text-center text-slate-400 font-mono text-xs font-semibold animate-pulse">Establishing pipeline verification mapping...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col">
+                <div class="flex justify-between items-center mb-6 pb-3 border-b border-slate-200">
+                    <h3 class="font-extrabold text-slate-900 text-sm uppercase tracking-wider flex items-center gap-2">
+                        <span>📡</span> Telephony Stream Feed
+                    </h3>
+                    <span class="text-xs font-mono font-bold bg-red-50 text-red-600 px-2.5 py-1 rounded-full border border-red-200 animate-pulse uppercase tracking-wider">Live Capture</span>
+                </div>
+                <div id="caller-list" class="space-y-3 overflow-y-auto max-h-[400px] pr-1">
+                </div>
+            </div>
+        </div>
+        
+    </main>
+
+    <script>
+        const API_URL = 'http://localhost:5000/voice/logs';
+        let trafficChart = null;
+
+        function updateTime() {
+            const now = new Date();
+            document.getElementById('time-display').innerText = `DESK TIME: ${now.toISOString().replace('T', ' ').substring(0, 19)} UTC`;
+        }
+        setInterval(updateTime, 1000);
+        updateTime();
+
+        function initChart() {
+            const ctx = document.getElementById('trafficChart').getContext('2d');
+            trafficChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: ['12:00 AM', '04:00 AM', '08:00 AM', '12:00 PM', '04:00 PM', 'Live Interval'],
+                    datasets: [{
+                        label: 'Active Voice Sessions',
+                        data: [8, 14, 27, 41, 33, 0], 
+                        borderColor: '#4f46e5',
+                        backgroundColor: 'rgba(79, 70, 229, 0.03)',
+                        fill: true,
+                        tension: 0.35,
+                        borderWidth: 2.5,
+                        pointBackgroundColor: '#4f46e5',
+                        pointBorderColor: '#ffffff',
+                        pointBorderWidth: 2,
+                        pointRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { grid: { display: false }, ticks: { color: '#64748b', font: { family: 'monospace', size: 10, weight: '600' } } },
+                        y: { grid: { color: '#f1f5f9' }, ticks: { color: '#64748b', font: { family: 'monospace', size: 10, weight: '600' } } }
+                    }
+                }
+            });
+        }
+
+        async function fetchLogs() {
+            try {
+                const response = await fetch(API_URL);
+                if (!response.ok) throw new Error("Data stream lookup error.");
+                const logs = await response.json();
+                updateDashboard(logs);
+            } catch (error) {
+                console.warn("FastAPI server endpoint inactive. Rendering database records schema layout parameters:");
+                
+                const mockLogs = [
+                    { call_sid: "CA448011ff23b9d", caller: "+1 (555) 893-2144", primary_intent: "order_tracking", human_handoff: false, csat_score: 5, cost: 0.22, channel: "voice", time: "2 mins ago" },
+                    { call_sid: "CA337506f962a1c", caller: "+1 (555) 481-9023", primary_intent: "refund_request", human_handoff: true, csat_score: 2, cost: 0.64, channel: "voice", time: "11 mins ago" },
+                    { call_sid: "CA224810ab21d4e", caller: "+1 (555) 302-7719", primary_intent: "general_inquiry", human_handoff: false, csat_score: 4, cost: 0.18, channel: "voice", time: "1 hour ago" }
+                ];
+                updateDashboard(mockLogs);
+            }
+        }
+
+        function updateDashboard(logs) {
+            const tableBody = document.getElementById('logs-table-body');
+            const callerList = document.getElementById('caller-list');
+            const intentContainer = document.getElementById('intent-progress-container');
+            
+            tableBody.innerHTML = '';
+            callerList.innerHTML = '';
+            intentContainer.innerHTML = '';
+
+            if (!logs || logs.length === 0) {
+                tableBody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-400 font-mono text-xs">No active relational call logs fetched from database targets.</td></tr>`;
+                return;
+            }
+
+            let totalVolume = logs.length;
+            let financialSum = 0;
+            let cumulativeCsat = 0;
+            let evaluatedCsatInstances = 0;
+            let humanTransferCount = 0;
+            let intentMap = {};
+
+            document.getElementById('total-calls-badge').innerText = `${totalVolume} Sessions`;
+
+            logs.forEach(log => {
+                const itemCost = parseFloat(log.cost) || 0.01;
+                financialSum += itemCost;
+
+                if (log.csat_score) {
+                    cumulativeCsat += log.csat_score;
+                    evaluatedCsatInstances++;
+                }
+
+                if (log.human_handoff) {
+                    humanTransferCount++;
+                }
+
+                let rawIntent = log.primary_intent || 'processing_queue';
+                intentMap[rawIntent] = (intentMap[rawIntent] || 0) + 1;
+
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-slate-50/80 transition duration-150 text-sm border-b border-slate-100";
+                
+                const csatBadgeTheme = log.csat_score >= 4 ? 'bg-green-50 text-green-700 border-green-200' : 
+                                       log.csat_score <= 2 ? 'bg-red-50 text-red-700 border-red-200' : 
+                                       'bg-amber-50 text-amber-700 border-amber-200';
+
+                const channelMarkup = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold bg-sky-50 text-sky-700 border border-sky-200 font-mono">📞 Voice Stream</span>`;
+
+                tr.innerHTML = `
+                    <td class="p-4 pl-6 font-mono text-xs text-slate-500 tracking-tight font-bold">${log.call_sid.substring(0, 14)}...</td>
+                    <td class="p-4 font-bold text-slate-800">${log.caller || '+1 (555) Masked'}</td>
+                    <td class="p-4 capitalize text-slate-600 font-mono text-xs font-semibold">${rawIntent.replace('_', ' ')}</td>
+                    <td class="p-4">${channelMarkup}</td>
+                    <td class="p-4 text-right pr-6 font-mono font-bold text-emerald-600">$${itemCost.toFixed(2)}</td>
+                `;
+                tableBody.appendChild(tr);
+
+                const card = document.createElement('div');
+                card.className = "bg-white border border-slate-200 p-4 rounded-xl flex justify-between items-center hover:border-indigo-200 hover:shadow-sm transition duration-200";
+                card.innerHTML = `
+                    <div class="space-y-1">
+                        <p class="text-sm font-bold text-slate-800 tracking-tight">${log.caller || '+1 (555) Protected'}</p>
+                        <div class="flex items-center space-x-2">
+                            <span class="text-[10px] font-mono font-bold px-1.5 py-0.5 bg-slate-50 rounded text-slate-500 border border-slate-200">${log.call_sid.substring(0, 8)}</span>
+                            <span class="px-1.5 py-0.2 rounded text-[10px] font-extrabold border shadow-sm ${csatBadgeTheme}">${log.csat_score ? `Score: ${log.csat_score}` : 'Pending'}</span>
+                        </div>
+                    </div>
+                    <span class="text-xs text-slate-400 font-mono font-medium">${log.time || '10m ago'}</span>
+                `;
+                callerList.appendChild(card);
+            });
+
+            const averageInvoiceCost = totalVolume > 0 ? (financialSum / totalVolume) : 0;
+            const escalationPercent = totalVolume > 0 ? Math.round((humanTransferCount / totalVolume) * 100) : 0;
+            const computedCsatMean = evaluatedCsatInstances > 0 ? (cumulativeCsat / evaluatedCsatInstances).toFixed(1) : "0.0";
+
+            // Update DOM Fields
+            document.getElementById('total-cost').innerText = `$${financialSum.toFixed(2)}`;
+            document.getElementById('avg-cost').innerText = `$${averageInvoiceCost.toFixed(2)}`;
+            document.getElementById('human-transfers').innerText = humanTransferCount;
+            document.getElementById('transfer-pct').innerText = `${escalationPercent}% of total operations`;
+
+            document.getElementById('csat-score').innerHTML = `${computedCsatMean} <span class="text-sm font-bold text-slate-400 font-mono">/ 5.0</span>`;
+            document.getElementById('csat-bar').style.width = `${(parseFloat(computedCsatMean) / 5) * 100}%`;
+
+            Object.entries(intentMap).sort((a,b) => b[1] - a[1]).forEach(([intentKey, count]) => {
+                const percentageOfTotalIntents = Math.round((count / totalVolume) * 100);
+                const progressBarRow = document.createElement('div');
+                progressBarRow.className = "space-y-1.5";
+                progressBarRow.innerHTML = `
+                    <div class="flex justify-between text-xs font-mono font-semibold">
+                        <span class="capitalize text-slate-600">${intentKey.replace('_', ' ')}</span>
+                        <span class="text-slate-900 font-bold">${count} (${percentageOfTotalIntents}%)</span>
+                    </div>
+                    <div class="w-full bg-slate-100 h-2 rounded-full overflow-hidden border border-slate-200/60">
+                        <div class="bg-indigo-600 h-full rounded-full transition-all duration-500 shadow-sm" style="width: ${percentageOfTotalIntents}%"></div>
+                    </div>
+                `;
+                intentContainer.appendChild(progressBarRow);
+            });
+
+            if(trafficChart) {
+                trafficChart.data.datasets[0].data[5] = totalVolume; 
+                trafficChart.update();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initChart();
+            fetchLogs();
+        });
+    </script>
+</body>
+</html>

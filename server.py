@@ -8,31 +8,23 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
 from llm import chat
-from db.database import (
-    start_call,
-    end_call,
-    get_all_calls,
-    get_call_transcript,
-    save_recording,
-    set_call_state,
-    get_call_state,
-    get_cached_response,
-    get_order_context,
-    update_call_state,
-    delete_call_state,
-    cache_set,
-    cache_get,
-    cache_delete,
-    cache_keys,
-    cache_ping
-)
+from websockets.exceptions import ConnectionClosed
+from db.cache_management import cache_set, cache_get, cache_delete, cache_keys, cache_ping
+from db.main_db import execute_query
+from db.call_tracking import set_call_state,get_call_state,update_call_state,delete_call_state
+from db.call_core_log import start_call, end_call
+from db.transcription import get_all_calls, get_call_transcript, save_recording, save_message
+from db.dashboard_content import get_cached_response
+from db.order_context_verify import get_order_context
 import os
 import re
 import time
-
+from twilio.rest import Client as TwilioClient
+from sms_handler import sms_router
 load_dotenv()
 
 app = FastAPI()
+app.include_router(sms_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
-
 
 # ════════════════════════════════════════════════════
 # Dead call monitor
@@ -152,16 +143,20 @@ def build_response_twiml(text, host, call_sid, verified=False):
 # ════════════════════════════════════════════════════
 
 async def process_transcript(call_sid: str, transcript: str, host: str, websocket: WebSocket):
-    from twilio.rest import Client as TwilioClient
-
     print(f"[{call_sid}] Deepgram STT: '{transcript}'")
 
     update_call_state(call_sid, is_speaking=True, last_activity_at=time.time())
 
-    # Goodbye detection
+    # Goodbye detection -> Reroute dynamically to Survey Endpoint via Twilio REST API
     goodbye_words = ["goodbye", "bye", "thank you", "thanks", "that's all"]
     if any(word in transcript.lower() for word in goodbye_words):
-        end_call(call_sid)
+        print(f"[{call_sid}] Goodbye detected. Rerouting call session to automated survey.")
+        try:
+            twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+            twilio_client.calls(call_sid).update(url=f"https://{host}/voice/trigger-survey", method="POST")
+        except Exception as e:
+            print(f"[{call_sid}] Twilio REST survey redirection failed: {e}")
+            end_call(call_sid)
         return
 
     # Check cache
@@ -169,7 +164,6 @@ async def process_transcript(call_sid: str, transcript: str, host: str, websocke
     response_text = get_cached_response(cache_key)
 
     if response_text:
-        from db.database import save_message
         save_message(call_sid, "user", transcript)
         save_message(call_sid, "assistant", response_text)
         print(f"[{call_sid}] Cache hit")
@@ -199,7 +193,7 @@ async def process_transcript(call_sid: str, transcript: str, host: str, websocke
 
     print(f"[{call_sid}] Agent: {response_text}")
 
-    # ── Play response via Twilio REST API (most reliable method) ──
+    # ── Play response via Twilio REST API ──
     try:
         twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
         play_block = get_play_block(response_text, host)
@@ -251,7 +245,6 @@ async def incoming_call(request: Request):
     play_block = get_play_block(greeting, host)
 
     try:
-        from twilio.rest import Client as TwilioClient
         twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
         twilio_client.calls(call_sid).recordings.create(
             recording_status_callback=f"https://{host}/recording-status",
@@ -362,15 +355,15 @@ async def ask_again(call_sid: str, host: str, attempt: int, reason: str):
 
 
 async def process_order_id(order_id_str: str, call_sid: str, host: str):
-    response_text = chat(order_id_str, call_sid=call_sid)
-    print(f"[{call_sid}] Agent: {response_text}")
+    支配_text = chat(order_id_str, call_sid=call_sid)
+    print(f"[{call_sid}] Agent: {支配_text}")
 
     from db.database import get_verified_order
     verified = get_verified_order(call_sid) is not None
 
     if verified:
         set_call_state(call_sid, is_speaking=False, host=host)
-        play_block = get_play_block(response_text, host)
+        play_block = get_play_block(支配_text, host)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Start>
@@ -382,7 +375,7 @@ async def process_order_id(order_id_str: str, call_sid: str, host: str):
     <Pause length="120"/>
 </Response>"""
     else:
-        twiml = build_response_twiml(response_text, host, call_sid, verified=False)
+        twiml = build_response_twiml(支配_text, host, call_sid, verified=False)
 
     return Response(content=twiml, media_type="text/xml")
 
@@ -461,6 +454,47 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
 
 
 # ════════════════════════════════════════════════════
+# CSAT Survey Webhook Routes
+# ════════════════════════════════════════════════════
+
+@app.post("/voice/trigger-survey")
+async def trigger_survey(request: Request):
+    host = request.headers.get("host")
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather input="speech" action="https://{host}/voice/survey-callback" timeout="5" speechTimeout="auto" language="en-IN">
+        <Say voice="Polly.Joanna">
+            Thank you for using our service. Before you go, please rate your experience today from 1 to 5, where 5 is excellent.
+        </Say>
+    </Gather>
+    <Redirect method="POST">https://{host}/voice/survey-callback</Redirect>
+</Response>"""
+    return Response(content=twiml_response, media_type="application/xml")
+
+
+@app.post("/voice/survey-callback")
+async def survey_callback(request: Request, SpeechResult: str = Form(None)):
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "unknown")
+
+    if SpeechResult:
+        print(f"[{call_sid}] Survey Speech Result captured: '{SpeechResult}'")
+        save_message(call_sid, "user", f"My rating is {SpeechResult}")
+    else:
+        print(f"[{call_sid}] Survey execution complete without an audio transcript submission.")
+        save_message(call_sid, "user", "[No survey response provided]")
+
+    end_call(call_sid)
+
+    twiml_goodbye = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">Thank you for your feedback. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+    return Response(content=twiml_goodbye, media_type="application/xml")
+
+
+# ════════════════════════════════════════════════════
 # Deepgram WebSocket
 # ════════════════════════════════════════════════════
 
@@ -468,96 +502,120 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
 async def media_stream(websocket: WebSocket):
     await websocket.accept()
 
-    call_sid = "unknown"
-    host = ""
+    stream_context = {
+        "call_sid": "unknown",
+        "host": "",
+        "websocket": websocket
+    }
+
     print(f"[unknown] Media stream connected — waiting for start event")
 
-    async for message in websocket.iter_text():
-        data = json.loads(message)
-        if data.get("event") == "start":
-            call_sid = data["start"].get("callSid", "unknown")
-            stream_sid = data["start"].get("streamSid", "unknown")
-            cache_set(f"stream_sid:{call_sid}", stream_sid)
-            state = get_call_state(call_sid)
-            host = state.get("host", "")
-            print(f"[{call_sid}] Media stream identified with StreamSid: {stream_sid}")
-            break
-
+    deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
     deepgram_ws = None
     deepgram_connected = False
 
     try:
-        deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
-        deepgram_ws = deepgram_client.listen.asyncwebsocket.v("1")
-
-        async def on_transcript(self, result, **kwargs):
-            try:
-                sentence = result.channel.alternatives[0].transcript
-                if not sentence or not result.is_final:
-                    return
-
-                state = get_call_state(call_sid)
-
-                if state.get("is_speaking", False):
-                    print(f"[{call_sid}] Muted — ignoring: '{sentence}'")
-                    return
-
-                resumed_at = state.get("resumed_at", 0)
-                if time.time() - resumed_at < 0.5:
-                    print(f"[{call_sid}] Cooldown — discarding: '{sentence}'")
-                    return
-
-                await process_transcript(call_sid, sentence, host, websocket=websocket)
-
-            except Exception as e:
-                print(f"[{call_sid}] Transcript error: {e}")
-
-        async def on_error(self, error, **kwargs):
-            print(f"[{call_sid}] Deepgram error: {error}")
-
-        deepgram_ws.on(LiveTranscriptionEvents.Transcript, on_transcript)
-        deepgram_ws.on(LiveTranscriptionEvents.Error, on_error)
-
-        options = LiveOptions(
-            model="nova-2",
-            language="en-IN",
-            encoding="mulaw",
-            sample_rate=8000,
-            endpointing=300,
-            interim_results=False,
-        )
-
-        result = await deepgram_ws.start(options)
-        if result is False:
-            raise Exception("Deepgram connection rejected — check API key")
-
-        deepgram_connected = True
-        print(f"[{call_sid}] Deepgram live connection opened")
-
+        # Loop 1: Find the configuration metadata start event
         async for message in websocket.iter_text():
             data = json.loads(message)
+            if data.get("event") == "start":
+                stream_context["call_sid"] = data["start"].get("callSid", "unknown")
+                stream_sid = data["start"].get("streamSid", "unknown")
+                cache_set(f"stream_sid:{stream_context['call_sid']}", stream_sid)
+                
+                state = get_call_state(stream_context["call_sid"])
+                stream_context["host"] = state.get("host", "")
+                
+                print(f"[{stream_context['call_sid']}] Media stream identified with StreamSid: {stream_sid}")
+                break 
+
+        # Loop 2: Handle incoming streaming media payloads safely
+        async for message in websocket.iter_text():
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            
             if data.get("event") == "media":
+                if deepgram_ws is None:
+                    print(f"[{stream_context['call_sid']}] First audio payload received! Initializing Deepgram...")
+                    deepgram_ws = deepgram_client.listen.asyncwebsocket.v("1")
+
+                    async def on_transcript(self, result, **kwargs):
+                        try:
+                            sentence = result.channel.alternatives[0].transcript
+                            if not sentence or not result.is_final:
+                                return
+
+                            state = get_call_state(stream_context["call_sid"])
+                            if state.get("is_speaking", False):
+                                return
+
+                            resumed_at = state.get("resumed_at", 0)
+                            if time.time() - resumed_at < 0.5:
+                                return
+
+                            await process_transcript(
+                                stream_context["call_sid"], 
+                                sentence, 
+                                stream_context["host"], 
+                                websocket=stream_context["websocket"]
+                            )
+                        except Exception as te:
+                            print(f"[{stream_context['call_sid']}] Transcript handling error: {te}")
+
+                    async def on_error(self, error, **kwargs):
+                        if "ConnectionClosed" in str(error):
+                            print(f"[{stream_context['call_sid']}] Deepgram WebSocket safely disconnected.")
+                        else:
+                            print(f"[{stream_context['call_sid']}] Deepgram client error: {error}")
+
+                    deepgram_ws.on(LiveTranscriptionEvents.Transcript, on_transcript)
+                    deepgram_ws.on(LiveTranscriptionEvents.Error, on_error)
+
+                    options = LiveOptions(
+                        model="nova-2",
+                        language="en-IN",
+                        encoding="mulaw",
+                        sample_rate=8000,
+                        endpointing=300,
+                        interim_results=False,
+                    )
+
+                    result = await deepgram_ws.start(options)
+                    if result is False:
+                        raise Exception("Deepgram connection rejected — check API key")
+
+                    deepgram_connected = True
+
+                # Forward binary audio packets to Deepgram
                 audio_chunk = base64.b64decode(data["media"]["payload"])
-                await deepgram_ws.send(audio_chunk)
+                if deepgram_connected and deepgram_ws:
+                    try:
+                        await deepgram_ws.send(audio_chunk)
+                    except (ConnectionClosed, Exception):
+                        break
+
             elif data.get("event") == "mark":
                 pass
+
             elif data.get("event") == "stop":
-                print(f"[{call_sid}] Stream stopped")
+                print(f"[{stream_context['call_sid']}] Stream received explicit stop event.")
                 break
 
-    except WebSocketDisconnect:
-        print(f"[{call_sid}] WebSocket disconnected")
+    except (WebSocketDisconnect, ConnectionClosed):
+        print(f"[{stream_context['call_sid']}] Twilio inbound streaming WebSocket disconnected gracefully.")
 
     except Exception as e:
-        print(f"[{call_sid}] Deepgram failed: {e} — switching to Twilio STT")
-        if host and call_sid != "unknown":
+        print(f"[{stream_context['call_sid']}] Deepgram loop lifecycle exception: {e}")
+        # Dynamic fallback redirection if initializing failed completely mid-flight
+        if stream_context["host"] and stream_context["call_sid"] != "unknown":
             try:
-                from twilio.rest import Client as TwilioClient
                 twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
                 fallback_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech"
-            action="https://{host}/handle-speech?call_sid={call_sid}"
+            action="https://{stream_context['host']}/handle-speech?call_sid={stream_context['call_sid']}"
             method="POST"
             speechTimeout="auto"
             timeout="15"
@@ -566,17 +624,23 @@ async def media_stream(websocket: WebSocket):
         <Say voice="Polly.Joanna">Sorry, please say your query.</Say>
     </Gather>
 </Response>"""
-                twilio_client.calls(call_sid).update(twiml=fallback_twiml)
-                print(f"[{call_sid}] Switched to Twilio STT fallback")
+                twilio_client.calls(stream_context["call_sid"]).update(twiml=fallback_twiml)
+                print(f"[{stream_context['call_sid']}] Switched to alternative Twilio STT fallback stream layer.")
             except Exception as fe:
-                print(f"[{call_sid}] Fallback failed: {fe}")
+                print(f"[{stream_context['call_sid']}] Fallback logic transmission failed: {fe}")
 
     finally:
+        print(f"[{stream_context['call_sid']}] Cleaning up connection resources...")
         if deepgram_connected and deepgram_ws:
-            await deepgram_ws.finish()
-        delete_call_state(call_sid)
-        cache_delete(f"stream_sid:{call_sid}")
-        print(f"[{call_sid}] Stream cleaned up")
+            try:
+                await deepgram_ws.finish()
+            except Exception:
+                pass
+        
+        if stream_context["call_sid"] != "unknown":
+            delete_call_state(stream_context["call_sid"])
+            cache_delete(f"stream_sid:{stream_context['call_sid']}")
+            print(f"[{stream_context['call_sid']}] Call lifecycle resources released cleanly.")
 
 
 # ════════════════════════════════════════════════════
@@ -613,9 +677,15 @@ async def handle_speech(
 </Response>"""
         return Response(content=twiml, media_type="text/xml")
 
+    # Goodbye detection inside fallback routing engine
     goodbye_words = ["goodbye", "bye", "thank you", "thanks", "that's all"]
     if any(word in final_transcript.lower() for word in goodbye_words):
-        end_call(call_sid)
+        print(f"[{call_sid}] Goodbye detected in STT Fallback. Redirecting to Survey.")
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Redirect method="POST">https://{host}/voice/trigger-survey</Redirect>
+</Response>"""
+        return Response(content=twiml, media_type="text/xml")
 
     cache_key = f"response_cache:{call_sid}:{final_transcript}"
     response_text = get_cached_response(cache_key)
@@ -662,7 +732,7 @@ async def recording_status(request: Request):
 
 
 # ════════════════════════════════════════════════════
-# Admin routes
+# Admin / Dashboard JSON routes
 # ════════════════════════════════════════════════════
 
 @app.get("/admin/calls")
@@ -712,6 +782,59 @@ async def view_transcript(call_sid: str):
     return Response(content=html, media_type="text/html")
 
 
+@app.get("/voice/logs")
+async def get_all_system_logs():
+    """
+    Fetches real-time omnichannel session logs out of the database 
+    formatted cleanly for the JavaScript admin dashboard.
+    """
+    try:
+        # Querying historical operational logs 
+        # (matching the fields expected by the UI table rows)
+        query = """
+            SELECT session_id, caller_reference, primary_intent, routing_channel, 
+                   human_handoff, csat_score, telemetry_cost, created_at 
+            FROM operational_logs 
+            ORDER BY created_at DESC LIMIT 50;
+        """
+        rows = execute_query(query, fetch_mode='all') or []
+        
+        formatted_logs = []
+        for r in rows:
+            formatted_logs.append({
+                "call_sid": r[0],
+                "caller": r[1],
+                "primary_intent": r[2] or "general_conversation",
+                "channel": r[3],           # Expected: 'sms' or 'voice'
+                "human_handoff": bool(r[4]),
+                "csat_score": r[5],         # Numeric score 1 to 5 or None
+                "cost": float(r[6]) if r[6] is not None else 0.01,
+                "time": r[7].strftime("%I:%M %p") if hasattr(r[7], 'strftime') else "Just Now"
+            })
+            
+        return formatted_logs
+
+    except Exception as e:
+        print(f"Error fetching logs for dashboard: {e}")
+        # Return an empty list so frontend doesn't crash on failure
+        return []
+
+# Add this endpoint to server.py if you want to access the UI via http://localhost:5000/dashboard
+@app.get("/dashboard")
+async def serve_dashboard():
+    return FileResponse("admin_dashboard.html")
+
+
+@app.post("/voice/callback-speak")
+def callback_speak():
+    twiml_response = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">Hello! This is your requested callback from the support team. Connecting you now.</Say>
+    <Hangup/>
+</Response>"""
+    return Response(content=twiml_response, media_type="application/xml")
+
+
 # ════════════════════════════════════════════════════
 # Startup
 # ════════════════════════════════════════════════════
@@ -722,4 +845,4 @@ if __name__ == "__main__":
     print("Starting AI Call Centre Server...")
     print("Server running on http://localhost:5000")
     print("Admin panel: http://localhost:5000/admin/calls")
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=True)
