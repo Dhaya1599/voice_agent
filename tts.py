@@ -9,7 +9,7 @@ load_dotenv()
 
 client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
-VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+VOICE_ID = os.getenv("BOT_AI_VOICE_ID")
 
 def speak(text):
     print(f"Speaking: {text}")
@@ -24,7 +24,7 @@ def speak(text):
     
     # Save to temp file
     temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    for chunk in audio:
+    for chunk in audio: 
         temp_file.write(chunk)
     temp_file.close()
     
