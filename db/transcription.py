@@ -17,7 +17,7 @@ def save_message(call_sid: str, role: str, content: str):
     fetch_instruction = "SELECT conversation FROM messages WHERE call_sid = %s"
     row = execute_query(fetch_instruction, (call_sid,), fetch_mode='one')
 
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     new_line = f"[{timestamp}] {role.upper()}: {content}"
 
     if row:
@@ -26,13 +26,13 @@ def save_message(call_sid: str, role: str, content: str):
             UPDATE messages SET conversation = %s, last_updated = %s
             WHERE call_sid = %s
         """
-        execute_query(update_instruction, (updated_conversation, datetime.now(), call_sid))
+        execute_query(update_instruction, (updated_conversation, datetime.datetime.now(), call_sid))
     else:
         insert_instruction = """
             INSERT INTO messages (call_sid, conversation, last_updated)
             VALUES (%s, %s, %s)
         """
-        execute_query(insert_instruction, (call_sid, new_line, datetime.now()))
+        execute_query(insert_instruction, (call_sid, new_line, datetime.datetime.now()))
 
 def get_conversation_history(call_sid: str):
     """Fetches a transcript and parses it into a clean list of dictionaries."""

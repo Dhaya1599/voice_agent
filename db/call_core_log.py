@@ -1,4 +1,4 @@
-import datetime 
+from datetime import datetime 
 from db.main_db import execute_query
 from db.transcription import get_call_transcript
 from db.dashboard_content import detect_intent

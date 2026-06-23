@@ -1,5 +1,5 @@
-import db.main_db import execute_query
-from cache_management import invalidate_categories_cache
+from db.main_db import execute_query
+from db.cache_management import invalidate_categories_cache
 
 def add_product(product_name, category, price, stock_available=True):
     """Add a new product and immediately invalidate categories cache."""

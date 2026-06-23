@@ -1,848 +1,217 @@
-from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
+import os
+import re
+import time
 import json
 import base64
 import asyncio
+from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
-from llm import chat
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions, Microphone
 from websockets.exceptions import ConnectionClosed
+
+# Local database and management imports
+from llm import chat
 from db.cache_management import cache_set, cache_get, cache_delete, cache_keys, cache_ping
 from db.main_db import execute_query
-from db.call_tracking import set_call_state,get_call_state,update_call_state,delete_call_state
+from db.call_tracking import set_call_state, get_call_state, update_call_state, delete_call_state
 from db.call_core_log import start_call, end_call
 from db.transcription import get_all_calls, get_call_transcript, save_recording, save_message
 from db.dashboard_content import get_cached_response
 from db.order_context_verify import get_order_context
-import os
-import re
-import time
 from twilio.rest import Client as TwilioClient
-from sms_handler import sms_router
+from otp_verification.voice_auth import auth_router
+
 load_dotenv()
 
 app = FastAPI()
-app.include_router(sms_router)
+app.include_router(auth_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"], #allows monitoring webistes to communicate with backend
+    allow_credentials=True, #secure authorization of cookies, tokens
+    allow_methods=["*"], #allows to perform fetch and update operations by dashboard
     allow_headers=["*"]
 )
 
-# ════════════════════════════════════════════════════
-# Dead call monitor
-# ════════════════════════════════════════════════════
+twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+dg_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
-async def monitor_dead_calls():
-    return
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(monitor_dead_calls())
-
-
-# ════════════════════════════════════════════════════
-# Spoken order ID converter
-# ════════════════════════════════════════════════════
-
-def spoken_to_order_id(text: str) -> str:
-    text = text.lower().strip()
-
-    multiplier_map = {
-        'double': 2, 'twice': 2,
-        'triple': 3, 'thrice': 3,
-        'quadruple': 4, 'quad': 4,
-        'quintuple': 5,
-    }
-
-    for word, times in multiplier_map.items():
-        pattern = rf'\b{word}\s+(zero|one|two|three|four|five|six|seven|eight|nine|oh)\b'
-        def expand(m, t=times):
-            return ' '.join([m.group(1)] * t)
-        text = re.sub(pattern, expand, text)
-
-    word_to_digit = {
-        'zero': '0', 'oh': '0',
-        'one': '1', 'won': '1',
-        'two': '2', 'to': '2', 'too': '2',
-        'three': '3',
-        'four': '4', 'for': '4', 'fore': '4',
-        'five': '5',
-        'six': '6',
-        'seven': '7',
-        'eight': '8', 'ate': '8',
-        'nine': '9',
-    }
-
-    for word, digit in sorted(word_to_digit.items(), key=lambda x: -len(x[0])):
-        text = re.sub(r'\b' + word + r'\b', digit, text)
-
-    return re.sub(r'[^0-9]', '', text)
-
-
-# ════════════════════════════════════════════════════
-# TwiML helpers
-# ════════════════════════════════════════════════════
-
-def get_play_block(text, host):
-    safe_text = text.replace("'", "").replace('"', "")
-    return f'<Say voice="Polly.Joanna">{safe_text}</Say>'
-
-
-def build_transfer_twiml(host, call_sid):
-    transfer_number = os.getenv("HUMAN_AGENT_NUMBER")
-    if transfer_number:
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Please hold while we connect you to a human agent.</Say>
-    <Dial>{transfer_number}</Dial>
-</Response>"""
-    else:
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">We are sorry, all agents are unavailable. Please call back later.</Say>
-    <Hangup/>
-</Response>"""
-
-
-def build_response_twiml(text, host, call_sid, verified=False):
-    play_block = get_play_block(text, host)
-
-    if verified:
-        gather = f"""<Gather input="speech"
-                action="https://{host}/handle-speech?call_sid={call_sid}"
-                method="POST"
-                speechTimeout="auto"
-                timeout="15"
-                language="en-IN"
-                speechModel="phone_call">
-            {play_block}
-        </Gather>"""
-    else:
-        gather = f"""<Gather input="dtmf"
-                action="https://{host}/handle-order-id?call_sid={call_sid}"
-                method="POST"
-                timeout="10"
-                finishOnKey="#">
-            {play_block}
-        </Gather>"""
-
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    {gather}
-</Response>"""
-
-
-# ════════════════════════════════════════════════════
-# Core transcript processor
-# ════════════════════════════════════════════════════
-
-async def process_transcript(call_sid: str, transcript: str, host: str, websocket: WebSocket):
-    print(f"[{call_sid}] Deepgram STT: '{transcript}'")
-
-    update_call_state(call_sid, is_speaking=True, last_activity_at=time.time())
-
-    # Goodbye detection -> Reroute dynamically to Survey Endpoint via Twilio REST API
-    goodbye_words = ["goodbye", "bye", "thank you", "thanks", "that's all"]
-    if any(word in transcript.lower() for word in goodbye_words):
-        print(f"[{call_sid}] Goodbye detected. Rerouting call session to automated survey.")
-        try:
-            twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-            twilio_client.calls(call_sid).update(url=f"https://{host}/voice/trigger-survey", method="POST")
-        except Exception as e:
-            print(f"[{call_sid}] Twilio REST survey redirection failed: {e}")
-            end_call(call_sid)
-        return
-
-    # Check cache
-    cache_key = f"response_cache:{call_sid}:{transcript}"
-    response_text = get_cached_response(cache_key)
-
-    if response_text:
-        save_message(call_sid, "user", transcript)
-        save_message(call_sid, "assistant", response_text)
-        print(f"[{call_sid}] Cache hit")
-    else:
-        print(f"[{call_sid}] Cache miss — sending to LLM")
-        try:
-            response_text = chat(transcript, call_sid=call_sid)
-        except Exception as e:
-            print(f"[{call_sid}] LLM error: {e}")
-            import traceback
-            traceback.print_exc()
-            response_text = None
-
-        if response_text:
-            cache_set(cache_key, response_text)
-
-    # LLM failed
-    if not response_text:
-        print(f"[{call_sid}] LLM failed — transferring to human agent")
-        twiml = build_transfer_twiml(host, call_sid)
-        try:
-            twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-            twilio_client.calls(call_sid).update(twiml=twiml)
-        except Exception as e:
-            print(f"[{call_sid}] Transfer failed: {e}")
-        return
-
-    print(f"[{call_sid}] Agent: {response_text}")
-
-    # ── Play response via Twilio REST API ──
-    try:
-        twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-        play_block = get_play_block(response_text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Start>
-        <Stream url="wss://{host}/media-stream">
-            <Parameter name="call_sid" value="{call_sid}"/>
-        </Stream>
-    </Start>
-    {play_block}
-    <Pause length="120"/>
-</Response>"""
-        twilio_client.calls(call_sid).update(twiml=twiml)
-        print(f"[{call_sid}] TwiML response injected via REST")
-    except Exception as e:
-        print(f"[{call_sid}] TwiML injection failed: {e}")
-
-    # Wait estimated speech duration before re-enabling listening
-    word_count = len(response_text.split())
-    duration = max(2.0, (word_count / 150) * 60)
-    await asyncio.sleep(duration)
-
-    update_call_state(
-        call_sid,
-        is_speaking=False,
-        resumed_at=time.time(),
-        last_activity_at=time.time()
-    )
-    print(f"[{call_sid}] Listening resumed")
-
-
-# ════════════════════════════════════════════════════
-# Call routes
-# ════════════════════════════════════════════════════
 
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
-    host = request.headers.get("host")
     form_data = await request.form()
+    call_sid = form_data.get("CallSid")
 
-    call_sid = form_data.get("CallSid", "unknown")
-    caller_number = form_data.get("From", "unknown")
+    print(f"[/incoming-call] CallSid: {call_sid}")
+    auth_session = cache_get(f"auth_state:{call_sid}")#fetch the sid related info from cache
+    print(f"[/incoming-call] Cache result: {auth_session}")
 
-    print(f"Incoming call! SID: {call_sid} From: {caller_number}")
-    start_call(call_sid, caller_number)
+    if auth_session and auth_session.get("status") == "VERIFIED":
+        from db.order_context_verify import save_verified_order
+        save_verified_order(call_sid, auth_session.get("order_id"))
 
-    greeting = "Hello! Welcome to customer support. Please say your Order ID clearly, digit by digit. For example, say one two three four for order 1234."
-    play_block = get_play_block(greeting, host)
-
-    try:
-        twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-        twilio_client.calls(call_sid).recordings.create(
-            recording_status_callback=f"https://{host}/recording-status",
-            recording_status_callback_method="POST"
-        )
-        print(f"[{call_sid}] Background recording started")
-    except Exception as e:
-        print(f"[{call_sid}] Could not start recording: {e}")
-
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        twiml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Pause length="3"/>
-    <Gather input="speech dtmf"
-            action="https://{host}/handle-order-id?call_sid={call_sid}&amp;attempt=1"
-            method="POST"
-            speechTimeout="auto"
-            timeout="15"
-            language="en-IN"
-            finishOnKey="#"
-            hints="zero, one, two, three, four, five, six, seven, eight, nine, double, triple, quadruple, oh">
-        {play_block}
-    </Gather>
+    <Connect>
+        <Stream url="wss://{request.url.hostname}/media-stream" />
+    </Connect> 
 </Response>"""
-    return Response(content=twiml, media_type="text/xml")
+        return Response(content=twiml_content, media_type="application/xml")
 
-
-@app.post("/handle-order-id")
-async def handle_order_id(request: Request, call_sid: str = ""):
-    host = request.headers.get("host")
-    if not call_sid:
-        call_sid = request.query_params.get("call_sid", "unknown")
-
-    attempt = int(request.query_params.get("attempt", "1"))
-    form_data = await request.form()
-    digits = form_data.get("Digits", "").strip()
-    speech = form_data.get("SpeechResult", "").strip()
-
-    if digits:
-        print(f"[{call_sid}] Order ID via keypad: {digits}")
-        return await process_order_id(digits, call_sid, host)
-
-    if speech:
-        order_id_str = spoken_to_order_id(speech)
-
-        if not order_id_str or len(order_id_str) != 4:
-            return await ask_again(call_sid, host, attempt, f"I heard {order_id_str or 'nothing'} which doesnt look like a valid 4 digit order ID")
-
-        print(f"[{call_sid}] Speech: '{speech}' -> Order ID: '{order_id_str}'")
-        cache_set(f"pending_order:{call_sid}", order_id_str)
-
-        spaced = ' '.join(list(order_id_str))
-        confirm_text = f"I heard order ID {spaced}. Is that correct? Say yes to confirm or no to try again."
-        play_block = get_play_block(confirm_text, host)
-
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # Fallback if reached unauthenticated
+    fallback_twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Gather input="speech"
-            action="https://{host}/confirm-order-id?call_sid={call_sid}&amp;attempt={attempt}"
-            method="POST"
-            speechTimeout="auto"
-            timeout="15"
-            language="en-IN"
-            speechModel="phone_call"
-            hints="yes:5, no:5, correct:3, wrong:3, right:3, yeah:5, nope:5, yep:3">
-        {play_block}
-    </Gather>
-    <Redirect method="POST">https://{host}/confirm-order-id?call_sid={call_sid}&amp;attempt={attempt}&amp;timeout=true</Redirect>
+    <Redirect>/voice/incoming</Redirect>
 </Response>"""
-        return Response(content=twiml, media_type="text/xml")
+    return Response(content=fallback_twiml, media_type="application/xml")
 
-    return await ask_again(call_sid, host, attempt, "didn't receive any input")
-
-
-async def ask_again(call_sid: str, host: str, attempt: int, reason: str):
-    if attempt >= 3:
-        text = "No problem. Please type your Order ID on the keypad and press the hash key."
-        play_block = get_play_block(text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="dtmf"
-            action="https://{host}/handle-order-id?call_sid={call_sid}&amp;attempt={attempt}"
-            method="POST"
-            timeout="20"
-            finishOnKey="#">
-        {play_block}
-    </Gather>
-    <Redirect method="POST">https://{host}/handle-order-id?call_sid={call_sid}&amp;attempt={attempt}</Redirect>
-</Response>"""
-    else:
-        next_attempt = attempt + 1
-        text = f"Sorry, I {reason}. Please say your Order ID again, digit by digit."
-        play_block = get_play_block(text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="speech dtmf"
-            action="https://{host}/handle-order-id?call_sid={call_sid}&amp;attempt={next_attempt}"
-            method="POST"
-            speechTimeout="auto"
-            timeout="15"
-            language="en-IN"
-            finishOnKey="#"
-            hints="zero:5, oh:5, one:5, two:5, three:5, four:5, five:5, six:5, seven:5, eight:5, nine:5, double:3, triple:3">
-        {play_block}
-    </Gather>
-    <Redirect method="POST">https://{host}/handle-order-id?call_sid={call_sid}&amp;attempt={next_attempt}</Redirect>
-</Response>"""
-    return Response(content=twiml, media_type="text/xml")
-
-
-async def process_order_id(order_id_str: str, call_sid: str, host: str):
-    支配_text = chat(order_id_str, call_sid=call_sid)
-    print(f"[{call_sid}] Agent: {支配_text}")
-
-    from db.database import get_verified_order
-    verified = get_verified_order(call_sid) is not None
-
-    if verified:
-        set_call_state(call_sid, is_speaking=False, host=host)
-        play_block = get_play_block(支配_text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Start>
-        <Stream url="wss://{host}/media-stream">
-            <Parameter name="call_sid" value="{call_sid}"/>
-        </Stream>
-    </Start>
-    {play_block}
-    <Pause length="120"/>
-</Response>"""
-    else:
-        twiml = build_response_twiml(支配_text, host, call_sid, verified=False)
-
-    return Response(content=twiml, media_type="text/xml")
-
-
-@app.post("/confirm-order-id")
-async def confirm_order_id(request: Request, call_sid: str = ""):
-    host = request.headers.get("host")
-    if not call_sid:
-        call_sid = request.query_params.get("call_sid", "unknown")
-
-    attempt = int(request.query_params.get("attempt", "1"))
-    timeout = request.query_params.get("timeout", "false")
-
-    if timeout == "true":
-        order_id_str = cache_get(f"pending_order:{call_sid}") or "unknown"
-        spaced = ' '.join(list(order_id_str))
-        confirm_text = f"I didnt hear a response. Did you say order ID {spaced}? Please say yes or no."
-        play_block = get_play_block(confirm_text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="speech"
-            action="https://{host}/confirm-order-id?call_sid={call_sid}&amp;attempt={attempt}"
-            method="POST"
-            speechTimeout="auto"
-            timeout="15"
-            language="en-IN"
-            speechModel="phone_call"
-            hints="yes:5, no:5, yeah:5, nope:5">
-        {play_block}
-    </Gather>
-    <Redirect method="POST">https://{host}/confirm-order-id?call_sid={call_sid}&amp;attempt={attempt}&amp;timeout=true</Redirect>
-</Response>"""
-        return Response(content=twiml, media_type="text/xml")
-
-    form_data = await request.form()
-    speech = form_data.get("SpeechResult", "").strip().lower()
-
-    yes_words = ["yes", "yeah", "yep", "correct", "right", "sure", "confirm", "affirmative"]
-    no_words = ["no", "nope", "wrong", "incorrect", "negative", "retry", "again"]
-
-    confirmed = any(word in speech for word in yes_words)
-    denied = any(word in speech for word in no_words)
-
-    if confirmed:
-        order_id_str = cache_get(f"pending_order:{call_sid}")
-        cache_delete(f"pending_order:{call_sid}")
-        if order_id_str:
-            print(f"[{call_sid}] Order ID confirmed: {order_id_str}")
-            return await process_order_id(order_id_str, call_sid, host)
-        else:
-            return await ask_again(call_sid, host, attempt, "something went wrong")
-
-    elif denied:
-        cache_delete(f"pending_order:{call_sid}")
-        print(f"[{call_sid}] Order ID rejected — attempt {attempt}")
-        return await ask_again(call_sid, host, attempt, "lets try again")
-
-    else:
-        order_id_str = cache_get(f"pending_order:{call_sid}") or "unknown"
-        spaced = ' '.join(list(order_id_str))
-        confirm_text = f"Sorry, I didnt catch that. Did you say order ID {spaced}? Please say yes or no."
-        play_block = get_play_block(confirm_text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="speech"
-            action="https://{host}/confirm-order-id?call_sid={call_sid}&amp;attempt={attempt}"
-            method="POST"
-            speechTimeout="auto"
-            timeout="15"
-            language="en-IN"
-            hints="yes, no, correct, wrong, right, yeah, nope">
-        {play_block}
-    </Gather>
-</Response>"""
-        return Response(content=twiml, media_type="text/xml")
-
-
-# ════════════════════════════════════════════════════
-# CSAT Survey Webhook Routes
-# ════════════════════════════════════════════════════
-
-@app.post("/voice/trigger-survey")
-async def trigger_survey(request: Request):
-    host = request.headers.get("host")
-    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="speech" action="https://{host}/voice/survey-callback" timeout="5" speechTimeout="auto" language="en-IN">
-        <Say voice="Polly.Joanna">
-            Thank you for using our service. Before you go, please rate your experience today from 1 to 5, where 5 is excellent.
-        </Say>
-    </Gather>
-    <Redirect method="POST">https://{host}/voice/survey-callback</Redirect>
-</Response>"""
-    return Response(content=twiml_response, media_type="application/xml")
-
-
-@app.post("/voice/survey-callback")
-async def survey_callback(request: Request, SpeechResult: str = Form(None)):
-    form_data = await request.form()
-    call_sid = form_data.get("CallSid", "unknown")
-
-    if SpeechResult:
-        print(f"[{call_sid}] Survey Speech Result captured: '{SpeechResult}'")
-        save_message(call_sid, "user", f"My rating is {SpeechResult}")
-    else:
-        print(f"[{call_sid}] Survey execution complete without an audio transcript submission.")
-        save_message(call_sid, "user", "[No survey response provided]")
-
-    end_call(call_sid)
-
-    twiml_goodbye = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Thank you for your feedback. Goodbye.</Say>
-    <Hangup/>
-</Response>"""
-    return Response(content=twiml_goodbye, media_type="application/xml")
-
-
-# ════════════════════════════════════════════════════
-# Deepgram WebSocket
-# ════════════════════════════════════════════════════
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
+    """
+    Handles the real-time bidirectional audio routing loop between
+    Twilio, Deepgram (STT), and the LLM engine.
+    """
     await websocket.accept()
+    print("🚀 [WebSocket] Twilio media stream connection accepted.")
 
-    stream_context = {
-        "call_sid": "unknown",
-        "host": "",
-        "websocket": websocket
-    }
+    call_sid = None
+    stream_sid = None
+    dg_connection = None
+    loop = asyncio.get_running_loop()
 
-    print(f"[unknown] Media stream connected — waiting for start event")
-
-    deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
-    deepgram_ws = None
-    deepgram_connected = False
+    def on_transcript_received(self, result, **kwargs):
+        # from the deepgram created json result extract the channel in which 
+        # it will puck the first option and transcript it into text
+        sentence = result.channel.alternatives[0].transcript
+        if len(sentence.strip()) > 0:
+            asyncio.run_coroutine_threadsafe(
+                process_transcript(sentence, call_sid, websocket, stream_sid), loop
+            )
 
     try:
-        # Loop 1: Find the configuration metadata start event
-        async for message in websocket.iter_text():
+        config = LiveOptions(
+            model="nova-2-phonecall",
+            language="en-US",
+            encoding="mulaw",
+            sample_rate=8000,
+            interim_results=False, #only send the final trancription rather then bit
+            #by bit transcription
+            endpointing=300
+        )
+
+        dg_connection = dg_client.listen.live.v("1")
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript_received)
+        started=dg_connection.start(config)
+        print(f"Deepgram started: {started}")
+
+        while True:
+            message = await websocket.receive_text()
             data = json.loads(message)
+
             if data.get("event") == "start":
-                stream_context["call_sid"] = data["start"].get("callSid", "unknown")
-                stream_sid = data["start"].get("streamSid", "unknown")
-                cache_set(f"stream_sid:{stream_context['call_sid']}", stream_sid)
-                
-                state = get_call_state(stream_context["call_sid"])
-                stream_context["host"] = state.get("host", "")
-                
-                print(f"[{stream_context['call_sid']}] Media stream identified with StreamSid: {stream_sid}")
-                break 
+                call_sid = data["start"]["callSid"]
+                stream_sid = data["start"]["streamSid"]
 
-        # Loop 2: Handle incoming streaming media payloads safely
-        async for message in websocket.iter_text():
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            
-            if data.get("event") == "media":
-                if deepgram_ws is None:
-                    print(f"[{stream_context['call_sid']}] First audio payload received! Initializing Deepgram...")
-                    deepgram_ws = deepgram_client.listen.asyncwebsocket.v("1")
+                # Safely extract caller number with fallbacks
+                caller_number = (
+                    data["start"].get("customParameters", {}).get("caller_number")
+                    or data["start"].get("from")
+                    or "unknown"
+                )
 
-                    async def on_transcript(self, result, **kwargs):
-                        try:
-                            sentence = result.channel.alternatives[0].transcript
-                            if not sentence or not result.is_final:
-                                return
+                print(f"📡 [WebSocket] Media context established. Call ID: {call_sid} | Stream ID: {stream_sid}")
+                start_call(call_sid, caller_number)
 
-                            state = get_call_state(stream_context["call_sid"])
-                            if state.get("is_speaking", False):
-                                return
-
-                            resumed_at = state.get("resumed_at", 0)
-                            if time.time() - resumed_at < 0.5:
-                                return
-
-                            await process_transcript(
-                                stream_context["call_sid"], 
-                                sentence, 
-                                stream_context["host"], 
-                                websocket=stream_context["websocket"]
-                            )
-                        except Exception as te:
-                            print(f"[{stream_context['call_sid']}] Transcript handling error: {te}")
-
-                    async def on_error(self, error, **kwargs):
-                        if "ConnectionClosed" in str(error):
-                            print(f"[{stream_context['call_sid']}] Deepgram WebSocket safely disconnected.")
-                        else:
-                            print(f"[{stream_context['call_sid']}] Deepgram client error: {error}")
-
-                    deepgram_ws.on(LiveTranscriptionEvents.Transcript, on_transcript)
-                    deepgram_ws.on(LiveTranscriptionEvents.Error, on_error)
-
-                    options = LiveOptions(
-                        model="nova-2",
-                        language="en-IN",
-                        encoding="mulaw",
-                        sample_rate=8000,
-                        endpointing=300,
-                        interim_results=False,
-                    )
-
-                    result = await deepgram_ws.start(options)
-                    if result is False:
-                        raise Exception("Deepgram connection rejected — check API key")
-
-                    deepgram_connected = True
-
-                # Forward binary audio packets to Deepgram
-                audio_chunk = base64.b64decode(data["media"]["payload"])
-                if deepgram_connected and deepgram_ws:
-                    try:
-                        await deepgram_ws.send(audio_chunk)
-                    except (ConnectionClosed, Exception):
-                        break
-
-            elif data.get("event") == "mark":
-                pass
+            elif data.get("event") == "media":
+                if dg_connection:
+                    audio_payload = data["media"]["payload"]
+                    raw_audio_bytes = base64.b64decode(audio_payload)
+                    dg_connection.send(raw_audio_bytes)
 
             elif data.get("event") == "stop":
-                print(f"[{stream_context['call_sid']}] Stream received explicit stop event.")
+                print(f"🛑 [WebSocket] Twilio issued termination packet for: {call_sid}")
                 break
 
-    except (WebSocketDisconnect, ConnectionClosed):
-        print(f"[{stream_context['call_sid']}] Twilio inbound streaming WebSocket disconnected gracefully.")
-
+    except WebSocketDisconnect:
+        print(f"🔌 [WebSocket] Connection detached normally for Call: {call_sid}")
     except Exception as e:
-        print(f"[{stream_context['call_sid']}] Deepgram loop lifecycle exception: {e}")
-        # Dynamic fallback redirection if initializing failed completely mid-flight
-        if stream_context["host"] and stream_context["call_sid"] != "unknown":
-            try:
-                twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-                fallback_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="speech"
-            action="https://{stream_context['host']}/handle-speech?call_sid={stream_context['call_sid']}"
-            method="POST"
-            speechTimeout="auto"
-            timeout="15"
-            language="en-IN"
-            speechModel="phone_call">
-        <Say voice="Polly.Joanna">Sorry, please say your query.</Say>
-    </Gather>
-</Response>"""
-                twilio_client.calls(stream_context["call_sid"]).update(twiml=fallback_twiml)
-                print(f"[{stream_context['call_sid']}] Switched to alternative Twilio STT fallback stream layer.")
-            except Exception as fe:
-                print(f"[{stream_context['call_sid']}] Fallback logic transmission failed: {fe}")
-
+        print(f"⚠️ [WebSocket] Stream runtime error: {e}")
     finally:
-        print(f"[{stream_context['call_sid']}] Cleaning up connection resources...")
-        if deepgram_connected and deepgram_ws:
-            try:
-                await deepgram_ws.finish()
-            except Exception:
-                pass
+        if dg_connection:
+            dg_connection.finish()
+        if call_sid:
+            end_call(call_sid)
+        print("🔒 [WebSocket] Streaming lifecycle closed.")
+
+
+async def process_transcript(transcript: str, call_sid: str, websocket: WebSocket, stream_sid: str):
+    if not transcript.strip():
+        return
+
+    print(f"[{call_sid}] Deepgram STT: '{transcript}'")
+    save_message(call_sid, "user", transcript)
+
+
+    cleaned_input = normalize_phonetic_input(transcript)
+    print(f"[{call_sid}] Normalization Applied: '{cleaned_input}'")
+
+    # Send the cleaned alpha-numeric ID (like AP36TF) to your DB or LLM logic
+    response_text = chat(cleaned_input, call_sid=call_sid)
+    # 1. Human handoff trigger
+    if response_text and "[TRIGGER_HUMAN_HANDOFF]" in response_text:
+        print(f"[{call_sid}] Flag sequence detected. Triggering agent transfer routing...")
+        update_call_state(call_sid, is_speaking=True, handoff=True)
+
+        handoff_twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">Please hold while I transfer your call to a retail logistics specialist.</Say>
+    <Dial>+198807675348</Dial>
+</Response>"""
+        try:
+            twilio_client.calls(call_sid).update(twiml=handoff_twiml)
+        except Exception as twilio_err:
+            print(f"[{call_sid}] Twilio live call stream intervention failed: {twilio_err}")
+        return
+
+    # 2. Speak Maya's response back into the call
+    if response_text:
+        print(f"[{call_sid}] Agent: {response_text}")
+        save_message(call_sid, "assistant", response_text)
+
+        speak_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">{response_text}</Say>
+    <Connect>
+        <Stream url="wss://{websocket.url.hostname}/media-stream" />
+    </Connect>
+</Response>"""
+        try:
+            twilio_client.calls(call_sid).update(twiml=speak_twiml)
+        except Exception as e:
+            print(f"⚠️ Failed to update live session stream back to call window: {e}")
+
+
+def normalize_phonetic_input(raw_speech: str) -> str:
+    text = raw_speech.lower().strip()
+    # Dynamic regex cleaning for elongated sounds (e.g., 'aeee' -> 'a')
+    
+    text = re.sub(r'(\w)\1+', r'\1', text)
+    
+    # 3. Handle trailing phonetic filler vowels (e.g., 'peee' -> 'pe' -> 'p', 'teee' -> 't')
+    # This strips trailing 'e's if they follow letters commonly elongated with an 'ee' sound.
+    text = re.sub(r'\b([b-df-hj-np-tv-z])e\b', r'\1', text)
+
+    number_map = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+                  "six": "6", "seven": "7", "eight": "8", "nine": "9", "zero": "0"}
+    for word, digit in number_map.items():
+        text = text.replace(word, digit)
         
-        if stream_context["call_sid"] != "unknown":
-            delete_call_state(stream_context["call_sid"])
-            cache_delete(f"stream_sid:{stream_context['call_sid']}")
-            print(f"[{stream_context['call_sid']}] Call lifecycle resources released cleanly.")
-
-
-# ════════════════════════════════════════════════════
-# Twilio STT fallback
-# ════════════════════════════════════════════════════
-
-@app.post("/handle-speech")
-async def handle_speech(
-    request: Request,
-    SpeechResult: str = Form(default=""),
-    call_sid: str = ""
-):
-    host = request.headers.get("host")
-    if not call_sid:
-        call_sid = request.query_params.get("call_sid", "unknown")
-
-    final_transcript = SpeechResult.strip()
-    print(f"[{call_sid}] Twilio STT fallback: '{final_transcript}'")
-
-    if not final_transcript:
-        sorry_text = "Sorry, I didnt catch that. Please say your query again."
-        play_block = get_play_block(sorry_text, host)
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Gather input="speech"
-            action="https://{host}/handle-speech?call_sid={call_sid}"
-            method="POST"
-            speechTimeout="auto"
-            timeout="10"
-            language="en-IN"
-            speechModel="phone_call">
-        {play_block}
-    </Gather>
-</Response>"""
-        return Response(content=twiml, media_type="text/xml")
-
-    # Goodbye detection inside fallback routing engine
-    goodbye_words = ["goodbye", "bye", "thank you", "thanks", "that's all"]
-    if any(word in final_transcript.lower() for word in goodbye_words):
-        print(f"[{call_sid}] Goodbye detected in STT Fallback. Redirecting to Survey.")
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Redirect method="POST">https://{host}/voice/trigger-survey</Redirect>
-</Response>"""
-        return Response(content=twiml, media_type="text/xml")
-
-    cache_key = f"response_cache:{call_sid}:{final_transcript}"
-    response_text = get_cached_response(cache_key)
-
-    if not response_text:
-        response_text = chat(final_transcript, call_sid=call_sid)
-
-    if response_text is None:
-        twiml = build_transfer_twiml(host, call_sid)
-        return Response(content=twiml, media_type="text/xml")
-
-    print(f"[{call_sid}] Agent: {response_text}")
-    twiml = build_response_twiml(response_text, host, call_sid, verified=True)
-    return Response(content=twiml, media_type="text/xml")
-
-
-# ════════════════════════════════════════════════════
-# Recording routes
-# ════════════════════════════════════════════════════
-
-@app.post("/handle-recording")
-async def handle_recording(request: Request, call_sid: str = ""):
-    if not call_sid:
-        call_sid = request.query_params.get("call_sid", "unknown")
-    form_data = await request.form()
-    recording_url = form_data.get("RecordingUrl", "")
-    recording_sid = form_data.get("RecordingSid", "")
-    if recording_url:
-        save_recording(call_sid, recording_url, recording_sid)
-    return Response(content="OK", media_type="text/plain")
-
-
-@app.post("/recording-status")
-async def recording_status(request: Request):
-    form_data = await request.form()
-    status = form_data.get("RecordingStatus", "")
-    recording_sid = form_data.get("RecordingSid", "")
-    recording_url = form_data.get("RecordingUrl", "")
-    call_sid = form_data.get("CallSid", "")
-    print(f"Recording {recording_sid} status: {status}")
-    if status == "completed" and recording_url and call_sid:
-        save_recording(call_sid, recording_url, recording_sid)
-    return Response(content="OK", media_type="text/plain")
-
-
-# ════════════════════════════════════════════════════
-# Admin / Dashboard JSON routes
-# ════════════════════════════════════════════════════
-
-@app.get("/admin/calls")
-async def view_calls():
-    calls = get_all_calls()
-    html = """
-    <html><head><title>Call Centre Admin</title>
-    <style>
-        body { font-family: Arial; padding: 20px; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-        th { background: #4CAF50; color: white; }
-        tr:nth-child(even) { background: #f2f2f2; }
-        a { color: #4CAF50; }
-    </style></head>
-    <body><h1>Call Centre — All Calls</h1>
-    <table><tr>
-        <th>Call SID (click for transcript)</th>
-        <th>From</th><th>Started</th><th>Ended</th>
-        <th>Status</th><th>Recording</th><th>Messages</th>
-    </tr>"""
-
-    for call in calls:
-        recording_link = f"<a href='{call[5]}' target='_blank'>▶️ Play</a>" if call[5] else "No recording"
-        html += f"""<tr>
-            <td><a href='/admin/transcript/{call[0]}'>{call[0]}</a></td>
-            <td>{call[1]}</td><td>{call[2]}</td><td>{call[3] or 'Active'}</td>
-            <td>{call[4]}</td><td>{recording_link}</td><td>{call[6]}</td>
-        </tr>"""
-
-    html += "</table></body></html>"
-    return Response(content=html, media_type="text/html")
-
-
-@app.get("/admin/transcript/{call_sid}")
-async def view_transcript(call_sid: str):
-    transcript = get_call_transcript(call_sid)
-    html = f"""<html><head><title>Transcript</title>
-    <style>
-        body {{ font-family: Arial; padding: 20px; }}
-        pre {{ background: #f5f5f5; padding: 20px; border-radius: 8px;
-               white-space: pre-wrap; word-wrap: break-word; }}
-    </style></head>
-    <body><h1>Transcript: {call_sid}</h1>
-    <a href='/admin/calls'>← Back to all calls</a><br><br>
-    <pre>{transcript}</pre></body></html>"""
-    return Response(content=html, media_type="text/html")
-
-
-@app.get("/voice/logs")
-async def get_all_system_logs():
-    """
-    Fetches real-time omnichannel session logs out of the database 
-    formatted cleanly for the JavaScript admin dashboard.
-    """
-    try:
-        # Querying historical operational logs 
-        # (matching the fields expected by the UI table rows)
-        query = """
-            SELECT session_id, caller_reference, primary_intent, routing_channel, 
-                   human_handoff, csat_score, telemetry_cost, created_at 
-            FROM operational_logs 
-            ORDER BY created_at DESC LIMIT 50;
-        """
-        rows = execute_query(query, fetch_mode='all') or []
-        
-        formatted_logs = []
-        for r in rows:
-            formatted_logs.append({
-                "call_sid": r[0],
-                "caller": r[1],
-                "primary_intent": r[2] or "general_conversation",
-                "channel": r[3],           # Expected: 'sms' or 'voice'
-                "human_handoff": bool(r[4]),
-                "csat_score": r[5],         # Numeric score 1 to 5 or None
-                "cost": float(r[6]) if r[6] is not None else 0.01,
-                "time": r[7].strftime("%I:%M %p") if hasattr(r[7], 'strftime') else "Just Now"
-            })
-            
-        return formatted_logs
-
-    except Exception as e:
-        print(f"Error fetching logs for dashboard: {e}")
-        # Return an empty list so frontend doesn't crash on failure
-        return []
-
-# Add this endpoint to server.py if you want to access the UI via http://localhost:5000/dashboard
-@app.get("/dashboard")
-async def serve_dashboard():
-    return FileResponse("admin_dashboard.html")
-
-
-@app.post("/voice/callback-speak")
-def callback_speak():
-    twiml_response = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Hello! This is your requested callback from the support team. Connecting you now.</Say>
-    <Hangup/>
-</Response>"""
-    return Response(content=twiml_response, media_type="application/xml")
-
-
-# ════════════════════════════════════════════════════
-# Startup
-# ════════════════════════════════════════════════════
+    return re.sub(r'[^a-z0-9]', '', text).upper()
 
 if __name__ == "__main__":
-    if cache_ping():
-        print("In-memory cache initialized")
-    print("Starting AI Call Centre Server...")
-    print("Server running on http://localhost:5000")
-    print("Admin panel: http://localhost:5000/admin/calls")
-    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=False)
