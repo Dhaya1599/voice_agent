@@ -27,7 +27,7 @@ def detect_sentiment(text: str) -> str:
         return "WORRIED"
     return "NEUTRAL"
 
-PERSONALITY_RULES =  """
+PERSONALITY_RULES = """
 PERSONALITY AND TONE:
 - You are warm, empathetic, and genuinely helpful — not robotic or scripted
 - Speak naturally like a real human support agent would on a phone call
@@ -80,14 +80,12 @@ def build_additional_context(msg: str) -> str:
     return ctx
 
 def sanitize_history(history: list) -> list:
+    if not history:
+        return []
     cleaned = []
-    user_texts = set()
     for msg in history:
-        if msg["role"] == "user":
-            user_texts.add(msg["content"].strip().lower())
-            cleaned.append(msg)
-        elif msg["role"] == "assistant":
-            cleaned.append(msg)
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            cleaned.append({"role": msg["role"], "content": msg["content"]})
     return cleaned
 
 def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
@@ -98,9 +96,6 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
     sentiment = detect_sentiment(user_message)
     sentiment_instruction = f"\n[CURRENT VOICE SENTIMENT DETECTED: {sentiment}]. Tailor your voice tone appropriately."
 
-    dynamic_product_rules = ""
-    
-    # ── Step 4: Build system prompt dynamically ──
     current_order_id = get_verified_order(call_sid) if call_sid else None
     extracted_id = extract_order_id(user_message)
     
@@ -134,15 +129,19 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
         today_str = get_today_string()
         additional_context = build_additional_context(user_message)
 
-        system_prompt = SYSTEM_PROMPT_VERIFIED.format(
+        # Base structure template formatting
+        base_prompt = SYSTEM_PROMPT_VERIFIED.format(
             today_date=today_str,
             order_context=formatted_context + str(additional_context)
-        ) + sentiment_instruction
+        )
+        
+        # Safely append structural rules without string matching syntax conflicts
+        system_prompt = base_prompt + "\n" + PERSONALITY_RULES + "\n" + NUMBER_FORMAT_RULE + sentiment_instruction
         print(f"[{call_sid}] Active Order Context Locked & Formatted: {current_order_id}")
     else:
         system_prompt = (
             "You are Maya, a warm and professional customer support agent. Keep all responses under 2 sentences.\n\n"
-            + PERSONALITY_RULES + "\n" + NUMBER_FORMAT_RULE + "\n" + dynamic_product_rules + "\n"
+            + PERSONALITY_RULES + "\n" + NUMBER_FORMAT_RULE + "\n"
             + "\nAsk the customer for their 4-digit Order ID to proceed."
         )
 
@@ -173,7 +172,9 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
             return None
 
     except Exception as e:
-        print(f"[{call_sid}] GROQ CRASH: {e}")
+        print(f"❌ [{call_sid}] GROQ CRASH RUNTIME ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         reply = ""
 
     if not reply or reply.lower() == user_message.lower():

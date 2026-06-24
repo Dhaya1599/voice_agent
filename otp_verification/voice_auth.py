@@ -61,12 +61,12 @@ async def handle_incoming_call(request: Request, CallSid: str = Form(...)): # ðŸ
     response = VoiceResponse()
     
     # Store initial state in application cache with dynamic timeout
-    cache_set(f"auth_state:{CallSid}", {"status": "AWAITING_ORDER_ID"}, expire_seconds=ORDER_ID_TIMEOUT)
+    cache_set(f"auth_state:{CallSid}", {"status": "AWAITING_ORDER_ID"})
     
     # Track voice processing fallback retry counters
     attempts = int(request.query_params.get('retry', 0))
     
-    if attempts < 3:
+    if attempts < 10:
         # Setup voice capture pipeline
         gather = Gather(
             input="speech", 
@@ -140,7 +140,7 @@ async def process_order(request: Request, CallSid: str = Form(None), SpeechResul
             "status": "AWAITING_OTP",
             "customer_phone": customer_phone,
             "order_id": order_id
-        }, expire_seconds=OTP_TIMEOUT)
+        })
         
         # Prompt for the numeric 6-digit SMS text code via DTMF keypad input collection
         gather = Gather(num_digits=6, action="/voice/verify-otp", method="POST", timeout=OTP_TIMEOUT)
@@ -190,7 +190,7 @@ async def verify_otp(CallSid: str = Form(None), Digits: str = Form(None)):
             cache_set(f"auth_state:{CallSid}", {
                 "status": "VERIFIED", 
                 "order_id": session_data.get("order_id")
-            }, expire_seconds=ORDER_ID_TIMEOUT)
+            })
             
             response.say("Identity verified successfully! Please hold while we connect you to your virtual assistant.", voice="Polly.Joanna")
             response.redirect("/incoming-call")

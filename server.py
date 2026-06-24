@@ -4,12 +4,13 @@ import time
 import json
 import base64
 import asyncio
+import httpx
 from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
-from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions, Microphone
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 from websockets.exceptions import ConnectionClosed
 
 # Local database and management imports
@@ -31,15 +32,34 @@ app.include_router(auth_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], #allows monitoring webistes to communicate with backend
-    allow_credentials=True, #secure authorization of cookies, tokens
-    allow_methods=["*"], #allows to perform fetch and update operations by dashboard
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"]
 )
 
 twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 dg_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
+async def text_to_speech_mulaw(text: str) -> bytes:
+    """
+    Converts LLM text output into 8kHz Mu-law audio bytes using Deepgram's Aura TTS API,
+    matching Twilio's required live telephone media stream format perfectly.
+    """
+    url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000"
+    headers = {
+        "Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {"text": text}
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, headers=headers, json=payload, timeout=15.0)
+        if response.status_code == 200:
+            return response.content
+        else:
+            print(f"❌ Deepgram TTS API Error: {response.status_code} - {response.text}")
+            return b""
 
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
@@ -47,7 +67,7 @@ async def incoming_call(request: Request):
     call_sid = form_data.get("CallSid")
 
     print(f"[/incoming-call] CallSid: {call_sid}")
-    auth_session = cache_get(f"auth_state:{call_sid}")#fetch the sid related info from cache
+    auth_session = cache_get(f"auth_state:{call_sid}")
     print(f"[/incoming-call] Cache result: {auth_session}")
 
     if auth_session and auth_session.get("status") == "VERIFIED":
@@ -62,7 +82,6 @@ async def incoming_call(request: Request):
 </Response>"""
         return Response(content=twiml_content, media_type="application/xml")
 
-    # Fallback if reached unauthenticated
     fallback_twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Redirect>/voice/incoming</Redirect>
@@ -73,8 +92,8 @@ async def incoming_call(request: Request):
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """
-    Handles the real-time bidirectional audio routing loop between
-    Twilio, Deepgram (STT), and the LLM engine.
+    Handles real-time bidirectional audio streaming between Twilio, Deepgram (STT),
+    Llama 3.1 8B (LLM), and Outbound Audio Playback (via base64 frames over WebSocket).
     """
     await websocket.accept()
     print("🚀 [WebSocket] Twilio media stream connection accepted.")
@@ -85,8 +104,6 @@ async def media_stream(websocket: WebSocket):
     loop = asyncio.get_running_loop()
 
     def on_transcript_received(self, result, **kwargs):
-        # from the deepgram created json result extract the channel in which 
-        # it will puck the first option and transcript it into text
         sentence = result.channel.alternatives[0].transcript
         if len(sentence.strip()) > 0:
             asyncio.run_coroutine_threadsafe(
@@ -99,15 +116,14 @@ async def media_stream(websocket: WebSocket):
             language="en-US",
             encoding="mulaw",
             sample_rate=8000,
-            interim_results=False, #only send the final trancription rather then bit
-            #by bit transcription
+            interim_results=False,
             endpointing=300
         )
 
         dg_connection = dg_client.listen.live.v("1")
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript_received)
-        started=dg_connection.start(config)
-        print(f"Deepgram started: {started}")
+        started = dg_connection.start(config)
+        print(f"Deepgram STT Live Connection Started: {started}")
 
         while True:
             message = await websocket.receive_text()
@@ -117,7 +133,6 @@ async def media_stream(websocket: WebSocket):
                 call_sid = data["start"]["callSid"]
                 stream_sid = data["start"]["streamSid"]
 
-                # Safely extract caller number with fallbacks
                 caller_number = (
                     data["start"].get("customParameters", {}).get("caller_number")
                     or data["start"].get("from")
@@ -156,15 +171,13 @@ async def process_transcript(transcript: str, call_sid: str, websocket: WebSocke
     print(f"[{call_sid}] Deepgram STT: '{transcript}'")
     save_message(call_sid, "user", transcript)
 
+    # Invoke Llama 3.1 8B Chat Engine
+    response_text = chat(transcript, call_sid=call_sid)
 
-    cleaned_input = normalize_phonetic_input(transcript)
-    print(f"[{call_sid}] Normalization Applied: '{cleaned_input}'")
-
-    # Send the cleaned alpha-numeric ID (like AP36TF) to your DB or LLM logic
-    response_text = chat(cleaned_input, call_sid=call_sid)
-    # 1. Human handoff trigger
-    if response_text and "[TRIGGER_HUMAN_HANDOFF]" in response_text:
-        print(f"[{call_sid}] Flag sequence detected. Triggering agent transfer routing...")
+    # 1. Human Handoff Routing Trigger
+    # If the user asks for an agent, our LLM passes None or triggers keywords. Let's explicitly look for handoff demands.
+    if response_text is None or "[TRIGGER_HUMAN_HANDOFF]" in response_text or any(k in transcript.lower() for k in ["agent", "human", "specialist", "supervisor"]):
+        print(f"[{call_sid}] Transfer requested. Executing live telephone line hot-swap intercept...")
         update_call_state(call_sid, is_speaking=True, handoff=True)
 
         handoff_twiml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -173,37 +186,37 @@ async def process_transcript(transcript: str, call_sid: str, websocket: WebSocke
     <Dial>+198807675348</Dial>
 </Response>"""
         try:
+            # Updating the active call to route to a hardcoded human agent line is safe here because we intend to exit the stream
             twilio_client.calls(call_sid).update(twiml=handoff_twiml)
         except Exception as twilio_err:
-            print(f"[{call_sid}] Twilio live call stream intervention failed: {twilio_err}")
+            print(f"[{call_sid}] Twilio live call agent transfer failed: {twilio_err}")
         return
 
-    # 2. Speak Maya's response back into the call
+    # 2. Asynchronous Conversational Streaming Response
     if response_text:
-        print(f"[{call_sid}] Agent: {response_text}")
+        print(f"[{call_sid}] Llama-8B Response: {response_text}")
         save_message(call_sid, "assistant", response_text)
 
-        speak_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">{response_text}</Say>
-    <Connect>
-        <Stream url="wss://{websocket.url.hostname}/media-stream" />
-    </Connect>
-</Response>"""
-        try:
-            twilio_client.calls(call_sid).update(twiml=speak_twiml)
-        except Exception as e:
-            print(f"⚠️ Failed to update live session stream back to call window: {e}")
+        # Generate audio payload on the fly without breaking the socket connection
+        audio_data = await text_to_speech_mulaw(response_text)
+        if audio_data:
+            base64_audio = base64.b64encode(audio_data).decode("utf-8")
+            
+            # Formulate standard Twilio outbound media message block
+            media_message = {
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {
+                    "payload": base64_audio
+                }
+            }
+            # Stream the voice frames right back down the established pipeline
+            await websocket.send_json(media_message)
 
 
 def normalize_phonetic_input(raw_speech: str) -> str:
     text = raw_speech.lower().strip()
-    # Dynamic regex cleaning for elongated sounds (e.g., 'aeee' -> 'a')
-    
     text = re.sub(r'(\w)\1+', r'\1', text)
-    
-    # 3. Handle trailing phonetic filler vowels (e.g., 'peee' -> 'pe' -> 'p', 'teee' -> 't')
-    # This strips trailing 'e's if they follow letters commonly elongated with an 'ee' sound.
     text = re.sub(r'\b([b-df-hj-np-tv-z])e\b', r'\1', text)
 
     number_map = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
@@ -211,7 +224,7 @@ def normalize_phonetic_input(raw_speech: str) -> str:
     for word, digit in number_map.items():
         text = text.replace(word, digit)
         
-    return re.sub(r'[^a-z0-9]', '', text).upper()
+    return re.sub(r'[^a-z0-9\s]', '', text).upper()
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=False)

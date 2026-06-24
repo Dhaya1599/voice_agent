@@ -139,4 +139,9 @@ def save_verified_order(call_sid, order_id):
 def get_verified_order(call_sid: str):
     """Checks if a call session has already been security verified."""
     instruction = "SELECT voice_code FROM call_verifications WHERE call_sid = %s"
-    return execute_query(instruction, (call_sid,), fetch_mode='one')
+    row = execute_query(instruction, (call_sid,), fetch_mode='one')
+    
+    # Extract the string element from the record tuple if it exists
+    if row and row[0]:
+        return str(row[0])
+    return None
