@@ -90,15 +90,51 @@ def get_order_context(order_id: int, call_sid: str = None):
 
 # ── CUSTOMER VOICE ORDER VERIFICATION ──
 
-def save_verified_order(call_sid: str, voice_code: str):
-    """Saves or updates a customer's pass-code verification state using EXCLUDED to prevent duplication."""
-    instruction = """
-        INSERT INTO call_verifications (call_sid, voice_code, verified_at)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (call_sid) DO UPDATE
-        SET voice_code = EXCLUDED.voice_code, verified_at = EXCLUDED.verified_at
+from datetime import datetime
+from db.main_db import execute_query
+from db.cache_management import cache_get
+
+from datetime import datetime
+from db.main_db import execute_query
+from db.cache_management import cache_get
+
+def save_verified_order(call_sid, order_id):
     """
-    execute_query(instruction, (call_sid, voice_code, datetime.now()))
+    Saves verified order context by cleanly aligning query placeholders
+    with the target columns present in 'calls'.
+    """
+    # 1. Fetch the phone number from the session cache
+    customer_phone = None
+    session_data = cache_get(f"auth_state:{call_sid}")
+    if session_data:
+        customer_phone = session_data.get("customer_phone")
+    
+    if not customer_phone:
+        customer_phone = "UNKNOWN"
+
+    # 2. Insert into the parent 'calls' table with exactly two parameters matching two columns
+    parent_instruction = """
+        INSERT INTO calls (call_sid, caller_number)
+        VALUES (%s, %s)
+        ON CONFLICT (call_sid) DO NOTHING;
+    """
+    try:
+        # ✅ Fixed: Tuple now contains exactly 2 parameters to match the 2 columns above
+        execute_query(parent_instruction, (call_sid, customer_phone), fetch_mode=None)
+        print(f"[{call_sid}] Parent dependency verified with phone: {customer_phone}")
+    except Exception as parent_err:
+        print(f"[{call_sid}] Parent insertion notice: {parent_err}")
+
+    # 3. Write verification record matching your voice_code column setup
+    child_instruction = """
+        INSERT INTO call_verifications (call_sid, voice_code, verified_at)
+        VALUES (%s, %s, %s);
+    """
+    try:
+        return execute_query(child_instruction, (call_sid, str(order_id), datetime.now()), fetch_mode=None)
+    except Exception as child_err:
+        print(f"❌ [Database Error] Could not save verification context: {child_err}")
+        raise child_err
 
 def get_verified_order(call_sid: str):
     """Checks if a call session has already been security verified."""
