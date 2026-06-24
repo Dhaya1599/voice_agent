@@ -3,6 +3,7 @@ from db.main_db import execute_query
 from db.transcription import get_call_transcript
 from db.dashboard_content import detect_intent
 from db.dashboard_content import parse_csat_from_transcript
+from datetime import datetime  
 
 def start_call(call_sid: str, caller_number: str):
     """Logs a new incoming call into the database."""
@@ -22,6 +23,14 @@ def end_call(call_sid: str):
         WHERE call_sid = %s
     """
     execute_query(instruction, (datetime.now(), call_sid))
+    
+    # Clean 4-space indent for the transcript call block
+    transcript = get_call_transcript(call_sid)
+
+    # Generalizing the intent, handoff and csat score as neutral
+    primary_intent = "general_conversation"
+    human_handoff = False
+    csat_score = None
     #fetching conversation from message table
     transcript = get_call_transcript(call_sid)
 
@@ -69,4 +78,3 @@ def end_call(call_sid: str):
     # Execute with the new parameter
     execute_query(message_instruction, (primary_intent, human_handoff, csat_score, call_cost, call_sid))
     print("Realtime call logs and cost metrics are updated in admin side!!!")
-    

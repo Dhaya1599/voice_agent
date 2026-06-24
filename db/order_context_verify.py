@@ -1,3 +1,6 @@
+from db.main_db import execute_query
+from datetime import datetime
+ 
 def get_order_context(order_id: int, call_sid: str = None):
     """Assembles an integrated string tracking blueprint of a specific order id."""
     order_query = """
@@ -99,9 +102,5 @@ def save_verified_order(call_sid: str, voice_code: str):
 
 def get_verified_order(call_sid: str):
     """Checks if a call session has already been security verified."""
-    instruction = """
-        SELECT voice_code FROM call_verifications
-        WHERE call_sid = %s AND verified_at IS NOT NULL
-    """
-    row = execute_query(instruction, (call_sid,), fetch_mode='one')
-    return row[0] if row else None
+    instruction = "SELECT voice_code FROM call_verifications WHERE call_sid = %s"
+    return execute_query(instruction, (call_sid,), fetch_mode='one')
