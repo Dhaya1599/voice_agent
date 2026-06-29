@@ -92,7 +92,6 @@ def sanitize_history(history: list) -> list:
 
 def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
     from db.order_context_verify import get_order_context, save_verified_order, get_verified_order
-    from db.dashboard_content import get_order_context_cached
     from db.call_tracking import update_call_state
 
     sentiment = detect_sentiment(user_message)
@@ -110,7 +109,7 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
         current_order_id = extracted_id
 
     if current_order_id:
-        raw_context = get_order_context_cached(int(current_order_id), call_sid)
+        raw_context = get_order_context(int(current_order_id), call_sid)
         if not raw_context:
             try:
                 raw_context = get_order_context(int(current_order_id))
@@ -120,11 +119,11 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
         if raw_context:
             try:
                 formatted_context = (
-                    f"\n[VERIFIED DATA LOGISTICS]:\n"
-                    f"- Current Customer Name: {raw_context[1] if len(raw_context) > 1 else 'Amirtha'}\n"
-                    f"- Order ID: {current_order_id}\n"
-                    f"- Delivery Status: {raw_context[2] if len(raw_context) > 2 else 'Delivered on April 22, 2026'}\n"
-                    f"- Delivery Address: {raw_context[4] if len(raw_context) > 4 else '78 MG Road, Bangalore, Karnataka 560001'}\n"
+                f"\n[VERIFIED DATA LOGISTICS]:\n"
+                f"- Current Customer Name: {raw_context[1] if len(raw_context) > 1 else 'Valued Customer'}\n"
+                f"- Order ID: {current_order_id}\n"
+                f"- Delivery Status: {raw_context[2] if len(raw_context) > 2 else 'Status Unavailable'}\n"
+                f"- Delivery Address: {raw_context[4] if len(raw_context) > 4 else 'Address Not Found'}\n"
                 )
             except Exception:
                 formatted_context = f"\n[VERIFIED DATA LOGISTICS]:\n{str(raw_context)}"
@@ -141,9 +140,9 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
         print(f"[{call_sid}] Active Order Context Locked & Formatted: {current_order_id}")
     else:
         system_prompt = (
-            "You are Maya, a warm and professional customer support agent. Keep all responses under 2 sentences.\n\n"
+            "You are Maya, a warm and professional customer support agent. Keep all responses under 2 sentences provide crisp solution.\n\n"
             + PERSONALITY_RULES + "\n" + NUMBER_FORMAT_RULE + "\n" + dynamic_product_rules + "\n"
-            + "\nAsk the customer for their 4-digit Order ID to proceed."
+            + "\nAsk the customer for their  Order ID to proceed."
         )
 
     # ── Step 5: Construct messages payload ──
@@ -177,6 +176,6 @@ def chat(user_message: str, history: list = None, call_sid: str = None) -> str:
         reply = ""
 
     if not reply or reply.lower() == user_message.lower():
-        reply = "I understand. Let me check what we can do for you regarding your query."
+        reply = "I'm sorry, I didn't quite catch that. Could you please say that again?"
 
     return reply

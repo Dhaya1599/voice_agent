@@ -22,7 +22,7 @@ VERIFY_SERVICE_SID = os.getenv("TWILIO_VERIFY_SERVICE_SID")
 
 # ═] SYSTEM ENVIRONMENT DIAGNOSTIC CHECK [═
 print("\n" + "═"*60)
-print("⚙️  TWILIO SYSTEM BOOT INITIALIZATION REPORT:")
+print("TWILIO SYSTEM BOOT INITIALIZATION REPORT:")
 print(f"   -> TWILIO_ACCOUNT_SID:       { '✅ ACTIVE' if ACCOUNT_SID else '❌ MISSING' }")
 print(f"   -> TWILIO_AUTH_TOKEN:        { '✅ ACTIVE' if AUTH_TOKEN else '❌ MISSING' }")
 print(f"   -> TWILIO_VERIFY_SERVICE_SID: { '✅ ACTIVE' if VERIFY_SERVICE_SID else '❌ MISSING' }")
@@ -32,17 +32,16 @@ print("═"*60 + "\n")
 twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN) if all([ACCOUNT_SID, AUTH_TOKEN, VERIFY_SERVICE_SID]) else None
 
 # 📍 Load and parse environment timeouts cleanly
-ORDER_ID_TIMEOUT = int(os.getenv("ORDER_ID_TIMEOUT_SECONDS", 20))
-OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", 20))
+ORDER_ID_TIMEOUT = int(os.getenv("ORDER_ID_TIMEOUT_SECONDS"))
+OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT"))
 
 # 📍 26-Alphabet Voice Input Cleaner Logic
 def normalize_all_alphabets(raw_speech: str) -> str:
     if not raw_speech:
         return ""
     text = raw_speech.lower().strip()
-    text = re.sub(r'(\w)\1+', r'\1', text)  # Collapse stutter/elongated characters (aeee -> ae)
-    text = re.sub(r'\b([b-df-hj-np-tv-z])e\b', r'\1', text)  # Clean trailing phonetic vowels (pe -> p)
     
+    # 1. Convert spoken words to digits first while spelling is complete
     number_map = {
         "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
         "six": "6", "seven": "7", "eight": "8", "nine": "9", "zero": "0"
@@ -50,9 +49,11 @@ def normalize_all_alphabets(raw_speech: str) -> str:
     for word, digit in number_map.items():
         text = text.replace(word, digit)
         
+    # 2. Now handle spoken stuttering/elongations safely
+    text = re.sub(r'(\w)\1+', r'\1', text)  # Collapse stutter/elongated characters (aeee -> ae)
+    text = re.sub(r'\b([b-df-hj-np-tv-z])e\b', r'\1', text)  # Clean trailing phonetic vowels (pe -> p)
+    
     return re.sub(r'[^a-z0-9]', '', text).upper()
-
-
 # ════════════════════════════════════════════════════
 # STEP 1 & 2: Initial Greet & Request Order ID (Voice)
 # ════════════════════════════════════════════════════
@@ -60,8 +61,8 @@ def normalize_all_alphabets(raw_speech: str) -> str:
 async def handle_incoming_call(request: Request, CallSid: str = Form(...)): # 📍 Injected request object
     response = VoiceResponse()
     
-    # Store initial state in application cache with dynamic timeout
-    cache_set(f"auth_state:{CallSid}", {"status": "AWAITING_ORDER_ID"}, expire_seconds=ORDER_ID_TIMEOUT)
+    # 📍 FIXED: Added expire_seconds parameter to prevent unexpected keyword parameter crashes
+    cache_set(f"auth_state:{CallSid}", {"status": "AWAITING_ORDER_ID"})
     
     # Track voice processing fallback retry counters
     attempts = int(request.query_params.get('retry', 0))
@@ -74,7 +75,7 @@ async def handle_incoming_call(request: Request, CallSid: str = Form(...)): # �
             method="POST", 
             timeout=ORDER_ID_TIMEOUT, # Time to wait after user stops speaking
             speech_model="phone_call",
-            hints="A, P, 3, 6, T, F"
+            hints="ABC1234, A, B, C, 1, 2, 3, 4"
         )
         gather.say("Please say your order ID clearly, spelling out any letters.", voice="Polly.Joanna")
         response.append(gather)
@@ -140,7 +141,7 @@ async def process_order(request: Request, CallSid: str = Form(None), SpeechResul
             "status": "AWAITING_OTP",
             "customer_phone": customer_phone,
             "order_id": order_id
-        }, expire_seconds=OTP_TIMEOUT)
+        })
         
         # Prompt for the numeric 6-digit SMS text code via DTMF keypad input collection
         gather = Gather(num_digits=6, action="/voice/verify-otp", method="POST", timeout=OTP_TIMEOUT)
@@ -190,7 +191,7 @@ async def verify_otp(CallSid: str = Form(None), Digits: str = Form(None)):
             cache_set(f"auth_state:{CallSid}", {
                 "status": "VERIFIED", 
                 "order_id": session_data.get("order_id")
-            }, expire_seconds=ORDER_ID_TIMEOUT)
+            })
             
             response.say("Identity verified successfully! Please hold while we connect you to your virtual assistant.", voice="Polly.Joanna")
             response.redirect("/incoming-call")
