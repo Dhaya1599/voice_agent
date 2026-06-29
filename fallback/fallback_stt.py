@@ -33,6 +33,7 @@ def record_audio():
 
     return temp_file.name
 
+ 
 def transcribe(audio_file_path):
     """Send audio file to Groq Whisper and get text back"""
 

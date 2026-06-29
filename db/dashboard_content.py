@@ -26,12 +26,6 @@ def detect_intent(text):
         
     return "general_conversation"
 
-def get_order_context_cached(order_id: int, call_sid: str = 'None'):
-    """
-    Wrapper function to satisfy the import requirement in llm.py.
-    Passes the order_id directly to the core aggregation logic.
-    """
-    return get_order_context(order_id)
 
 def get_cached_response(key, default=None):
     """

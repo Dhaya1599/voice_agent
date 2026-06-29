@@ -33,7 +33,8 @@ def update_call_state(call_sid: str, **kwargs):
         return
 
     transformations = {
-        "is_speaking": lambda v: str(int(v)),
+        "is_speaking": lambda v: str(int(v)), 
+        # convert the boolean-> int-> str without def
         "resumed_at": str,
         "last_activity_at": str,
         "host": str
