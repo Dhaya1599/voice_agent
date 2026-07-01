@@ -288,19 +288,6 @@ async def get_financials_endpoint():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Financial analytics extraction crashed: {str(e)}")
 
-
-## ==================================================================
-# 5. PAGINATED & SEARCHABLE ADMINISTRATION AUDIT LOGS (REST)
-# ==================================================================
-# ==================================================================
-# 5. CURSOR-PAGINATED ADMINISTRATION AUDIT LOGS (REST)
-# ==================================================================
-# ==================================================================
-# 3. STOCK & INVENTORY ALERT PANEL (REST)
-# ==================================================================
-# ==================================================================
-# 3. CORRECTED STOCK & INVENTORY ALERT PANEL (REST)
-# ==================================================================
 @app.get("/api/v1/inventory/alerts")
 async def get_inventory_alerts_endpoint():
     try:
@@ -396,7 +383,37 @@ async def export_logs_csv_endpoint():
         headers={"Content-Disposition": "attachment; filename=operational_telemetry_audit.csv"}
     )
 
+#------------------------------------------------------------
+# ADDING AGENTS ENDPOINT
+#------------------------------------------------------------
+@app.get(
+    "/api/v1/admin/agents/monitor",
+    tags=["Admin Auditing"],
+    summary="Get Live Agent Status and Queue Metrics"
+)
+async def get_agent_monitor_endpoint():
+    try:
+        agent_q = "SELECT name, phone_no, status FROM Agents;"
+        agent_rows = execute_query(agent_q, fetch_mode= 'all') or []
 
+        agents_list = []
+        for r in agent_rows:
+            agents_list.append({
+                "name": r[0],
+                "phone_no": r[1],
+                "status": r[2]
+            })
+
+        queue_q = "SELECT COUNT(*) FROM calls WHERE status = 'IN_PROGRESS';"
+        queue_res = execute_query(queue_q,fetch_mode = 'all')
+        queue_count = queue_res[0][0] if queue_res else 0
+
+        return{
+            "agents": agents_list,
+            "queue_count": queue_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, details=f"Fetch failed: {str(e)}")
 # ------------------------------------------------------------------
 # EXISTING VOICE WORKFLOWS & WEBSOCKET AUDIO LAYER
 # ------------------------------------------------------------------
