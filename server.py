@@ -335,17 +335,32 @@ async def get_inventory_alerts_endpoint():
 
 
 @app.get("/api/v1/inventory/top-performers")
-async def get_top_performers_endpoint(limit: int = Query(5, ge=1, le=20)):
+async def get_top_performers_endpoint(
+    limit: int = Query(5, ge=1, le=20),
+    category: Optional[str] = Query(None)
+):
     try:
-        query = """
+        conditions = []
+        params = []
+        
+        if category and category.lower() != "all":
+            conditions.append("p.category = %s")
+            params.append(category)
+            
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        
+        query = f"""
             SELECT p.product_id, p.product_name, p.category, COUNT(o.order_id) AS total_orders
             FROM orders o
             JOIN product_catalog p ON p.product_id = o.product_id
+            {where_clause}
             GROUP BY p.product_id, p.product_name, p.category
             ORDER BY total_orders DESC
             LIMIT %s;
         """
-        rows = execute_query(query, (limit,), fetch_mode='all') or []
+        params.append(limit)
+        
+        rows = execute_query(query, tuple(params), fetch_mode='all') or []
 
         top_performers = [
             {
@@ -471,6 +486,42 @@ async def get_agent_monitor_endpoint():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fetch failed: {str(e)}")
+
+
+@app.get(
+    "/api/v1/admin/agents/calls-per-hour",
+    tags=["Admin Auditing"],
+    summary="Get Hourly Call Volume for the last 24 Hours"
+)
+async def get_calls_per_hour_endpoint():
+    try:
+        query = """
+            SELECT 
+                TO_CHAR(DATE_TRUNC('hour', started_at), 'HH24:00') AS hour_label,
+                COUNT(*) AS call_count
+            FROM 
+                calls
+            WHERE 
+                started_at >= NOW() - INTERVAL '24 hours'
+            GROUP BY 
+                DATE_TRUNC('hour', started_at)
+            ORDER BY 
+                DATE_TRUNC('hour', started_at) ASC;
+        """
+        rows = execute_query(query, fetch_mode='all') or []
+        
+        calls_data = []
+        for r in rows:
+            calls_data.append({
+                "time": r[0],
+                "calls": r[1]
+            })
+            
+        return {
+            "calls_per_hour": calls_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch calls per hour: {str(e)}")
 # ------------------------------------------------------------------
 # EXISTING VOICE WORKFLOWS & WEBSOCKET AUDIO LAYER
 # ------------------------------------------------------------------
