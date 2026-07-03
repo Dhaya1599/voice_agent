@@ -287,30 +287,87 @@ async def get_financials_endpoint():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Financial analytics extraction crashed: {str(e)}")
+LOW_STOCK_THRESHOLD = 5
 
 @app.get("/api/v1/inventory/alerts")
 async def get_inventory_alerts_endpoint():
     try:
-        # Explicitly name the columns to avoid index errors
-        query = "SELECT product_id, item_name, quantity, is_available FROM inventory;"
+        query = """
+            SELECT i.product_id, i.item_name, i.quantity, i.is_available,
+                   p.category, p.price
+            FROM inventory i
+            LEFT JOIN product_catalog p ON p.product_id = i.product_id;
+        """
         rows = execute_query(query, fetch_mode='all') or []
-        
+
         alerts = []
         for r in rows:
-            # Explicit mapping based on SELECT order:
-            # r[0]=product_id, r[1]=item_name, r[2]=quantity, r[3]=is_available
+            quantity = r[2]
+            is_available = r[3]
+
+            if quantity == 0 or is_available == False:
+                trigger_state = "OUT_OF_STOCK"
+            elif quantity <= LOW_STOCK_THRESHOLD:
+                trigger_state = "LOW_STOCK"
+            else:
+                trigger_state = "IN_STOCK"
+
             alerts.append({
                 "product_id": r[0],
                 "product_name": r[1],
-                "category": "General",
-                "price": 0,
-                "trigger_state": "OUT_OF_STOCK" if (r[2] == 0 or r[3] == False) else "IN_STOCK"
+                "quantity": quantity,
+                "category": r[4] or "Uncategorized",
+                "price": float(r[5]) if r[5] is not None else 0,
+                "trigger_state": trigger_state
             })
+
+        low_stock_count = sum(1 for a in alerts if a["trigger_state"] == "LOW_STOCK")
+        out_of_stock_count = sum(1 for a in alerts if a["trigger_state"] == "OUT_OF_STOCK")
 
         return {
             "inventory_alerts": alerts,
-            "flash_banner_active": any(item["trigger_state"] == "OUT_OF_STOCK" for item in alerts)
+            "flash_banner_active": out_of_stock_count > 0,
+            "low_stock_count": low_stock_count,
+            "out_of_stock_count": out_of_stock_count
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/inventory/top-performers")
+async def get_top_performers_endpoint(limit: int = Query(5, ge=1, le=20)):
+    try:
+        query = """
+            SELECT p.product_id, p.product_name, p.category, COUNT(o.order_id) AS total_orders
+            FROM orders o
+            JOIN product_catalog p ON p.product_id = o.product_id
+            GROUP BY p.product_id, p.product_name, p.category
+            ORDER BY total_orders DESC
+            LIMIT %s;
+        """
+        rows = execute_query(query, (limit,), fetch_mode='all') or []
+
+        top_performers = [
+            {
+                "product_id": r[0],
+                "product_name": r[1],
+                "category": r[2],
+                "total_orders": r[3]
+            }
+            for r in rows
+        ]
+
+        return {"top_performers": top_performers}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/inventory/categories")
+async def get_inventory_alerts_endpoint():
+    try:
+        query = "SELECT DISTINCT category FROM product_catalog ORDER BY category;"
+        rows = execute_query(query, fetch_mode='all') or []
+        return {"categories": [r[0] for r in rows]}
+        
     except Exception as e:
         print(f"DEBUGGING ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -413,7 +470,7 @@ async def get_agent_monitor_endpoint():
             "queue_count": queue_count
         }
     except Exception as e:
-        raise HTTPException(status_code=500, details=f"Fetch failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Fetch failed: {str(e)}")
 # ------------------------------------------------------------------
 # EXISTING VOICE WORKFLOWS & WEBSOCKET AUDIO LAYER
 # ------------------------------------------------------------------
