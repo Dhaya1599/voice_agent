@@ -260,6 +260,39 @@ async def get_admin_logs_endpoint(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+# INTENT CATEGORY AGGREGATION FROM OPERATIONAL LOGS
+# ==================================================================
+@app.get(
+    "/api/v1/admin/logs/intent-summary",
+    tags=["Admin Auditing"],
+    summary="Aggregated Primary Intent Distribution",
+    description="Aggregates all primary_intent values from the operational_logs table and returns category counts with percentages."
+)
+async def get_intent_summary_endpoint():
+    try:
+        query = """
+            SELECT primary_intent, COUNT(*) as intent_count
+            FROM operational_logs
+            WHERE primary_intent IS NOT NULL AND primary_intent != ''
+            GROUP BY primary_intent
+            ORDER BY intent_count DESC;
+        """
+        rows = execute_query(query, fetch_mode='all') or []
+        total_count = sum(r[1] for r in rows)
+        categories = []
+        for r in rows:
+            percentage = round((r[1] / total_count) * 100, 1) if total_count > 0 else 0
+            categories.append({
+                "intent": r[0],
+                "count": r[1],
+                "percentage": percentage
+            })
+        return {
+            "total_logs": total_count,
+            "categories": categories
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Intent aggregation failed: {str(e)}")
 # ==================================================================
 # 4. PRE-COMPUTED PROFIT & REVENUE ANALYTICS (REST)
 # ==================================================================
